@@ -1,0 +1,210 @@
+modules:
+  jira:globalPage:
+    - key: project-bucket-router
+      resource: panel
+      resolver:
+        function: backend-resolver
+      title: Project Bucket Router
+      layout: basic
+
+  jira:adminPage:
+    - key: project-bucket-admin
+      title: Project Bucket Storage
+      resolver:
+        function: settings-resolver
+      render: native
+      resource: admin-resource
+
+  jira:projectSettingsPage:
+    - key: project-bucket-project-settings
+      title: Project Bucket Storage
+      resolver:
+        function: settings-resolver
+      render: native
+      resource: proj-settings-res
+
+  # F3 — Project Bucket issue panel. Owns the entire attachment experience:
+  # gallery, upload, search, filter, preview, delete, and diagnostics. Custom
+  # UI (not UI Kit) because previews need real <video>/<audio>/<iframe>
+  # elements, pan/zoom gesture handling, and a syntax-highlighted code viewer
+  # — none of which the native UI Kit render tree can produce.
+  jira:issuePanel:
+    - key: project-bucket-panel
+      resource: panel
+      resolver:
+        function: backend-resolver
+      title: Project Bucket
+      icon: https://developer.atlassian.com/platform/forge/images/icons/issue-panel-icon.svg
+
+  # Invisible watcher loaded on every issue view (independent of whether the
+  # panel is expanded). It polls for a "quiet" bulk-attachment session on this
+  # issue and, when one is found, shows exactly one grouped popup asking to
+  # link the newly detected native Jira attachments to Project Bucket. It
+  # also runs the migration pipeline client-side after the user confirms.
+  jira:issueViewBackgroundScript:
+    - key: project-bucket-watcher
+      resource: watcher
+      resolver:
+        function: backend-resolver
+
+  # Forge-hosted relational database. System of record for attachment
+  # metadata, bulk-detection sessions, and migration diagnostics. See
+  # src/db/schema.ts for the migration set.
+  sql:
+    - key: main
+      engine: mysql
+
+  # Fires once per native Jira attachment creation, instance-wide. Used only
+  # to append the new attachment into that issue's open bulk-detection
+  # session (src/services/sessionService.ts) — it never shows UI itself.
+  trigger:
+    - key: attachment-created
+      function: on-attachment-created
+      events:
+        - avi:jira:created:attachment
+    # F7 — any issue update may change issue visibility (security level,
+    # project move), so re-resolve ACLs and republish that issue's metadata
+    # into Teamwork Graph. No-op for issues without Project Bucket content.
+    - key: issue-updated
+      function: on-issue-updated
+      events:
+        - avi:jira:updated:issue
+
+  # Safety net that guarantees the SQL schema exists even if the first real
+  # resolver invocation after install races the migration. The schema
+  # migrations themselves are idempotent (CREATE TABLE IF NOT EXISTS), so
+  # running this hourly is a cheap no-op once the schema has been applied.
+  scheduledTrigger:
+    - key: schema-migration
+      function: run-schema-migration
+      interval: hour
+    # Hourly consistency sweep: (1) verifies every attachment's bytes still
+    # exist in the S3 bucket, quarantining rows whose objects vanished
+    # (2026-07-18 incident class) so the gallery never lists a file that can't
+    # be opened; (2) republishes all attachment metadata to the Teamwork Graph
+    # connector and drains queued graph deletes, guaranteeing metadata reaches
+    # the connector without depending on the platform's 24h task.
+    - key: consistency-sweep
+      function: run-consistency-sweep
+      interval: hour
+
+  # F7 — Teamwork Graph connector. Publishes attachment *metadata* (never
+  # file bytes) from Forge SQL into Teamwork Graph so Rovo Search can surface
+  # Project Bucket content. The admin performs a one-time Connect under
+  # Apps > Connected apps > Project Bucket > Connections; after that,
+  # publishing is automatic. There is no external datasource, so there is no
+  # admin configuration form and nothing to validate — onConnectionChange is
+  # the entire lifecycle surface.
+  graph:connector:
+    - key: project-bucket-graph-connector
+      name: Project Bucket
+      icons:
+        light: https://developer.atlassian.com/platform/forge/images/icons/issue-panel-icon.svg
+        dark: https://developer.atlassian.com/platform/forge/images/icons/issue-panel-icon.svg
+      capabilities:
+        replicatesPermissions: true
+        syncFidelity: mirror
+        supportsIncrementalSync: true
+      objectTypes:
+        - atlassian:document
+      datasource:
+        onConnectionChange:
+          function: on-connection-change
+      # Reconciliation sweep (F7 Option B): a 24h platform-scheduled task
+      # (scheduleOrUpdateTask in onConnectionChange) that retries queued graph
+      # deletes and refreshes all metadata/ACLs. Heals anything the
+      # event-driven path missed — Forge emits no events for permission
+      # scheme edits or group membership changes.
+      orchestration:
+        taskRunner:
+          function: graph-task-runner
+
+  function:
+    - key: settings-resolver
+      handler: resolvers/storageAdmin.handler
+    - key: backend-resolver
+      handler: index.handler
+    - key: on-attachment-created
+      handler: index.onAttachmentCreated
+    - key: run-schema-migration
+      handler: index.runSchemaMigration
+    - key: run-consistency-sweep
+      handler: index.runConsistencySweep
+    - key: on-connection-change
+      handler: index.onConnectionChange
+    - key: on-issue-updated
+      handler: index.onIssueUpdated
+    - key: graph-task-runner
+      handler: index.onGraphTask
+
+resources:
+  - key: panel
+    path: static/panel/build
+  - key: watcher
+    path: static/attachment-watcher/build
+  - key: admin-resource
+    path: src/ui/AdminPage.tsx
+  - key: proj-settings-res
+    path: src/ui/ProjectSettingsPage.tsx
+
+permissions:
+  scopes:
+    - storage:app
+    # Read issue/attachment metadata and content, and delete attachments
+    # (native attachment cleanup after a verified migration).
+    - read:jira-work
+    - write:jira-work
+    # Resolves accountId -> display name for the "uploaded by" column
+    # (GET /rest/api/3/user/bulk in useAccountNames.ts).
+    - read:jira-user
+    # F7 permission mirroring: enumerating group members
+    # (GET /rest/api/3/group/member in graphSyncService.ts) so Teamwork Graph
+    # GROUP principals resolve to the same users Jira grants browse to.
+    - manage:jira-configuration
+    # Teamwork Graph connector (F7): ingest, read back, and delete Project
+    # Bucket metadata objects in the graph.
+    - write:object:jira
+    - read:object:jira
+    - delete:object:jira
+  content:
+    styles:
+      # Preview components (image pan/zoom transforms, gallery layout) use
+      # inline style objects, which Custom UI's CSP blocks by default.
+      - unsafe-inline
+    scripts:
+      # pdf.js renders the first page of a PDF into a thumbnail at upload time.
+      # It loads its worker from a same-origin file, but falls back to spinning
+      # one up from a blob: URL, which script-src blocks unless declared here.
+      # Without this the fallback is silently killed and Chromium shows its
+      # "content blocked" placeholder instead of the preview.
+      # Quoted because a bare `blob:` is YAML for a null-valued mapping key,
+      # not the string the CSP needs.
+      - 'blob:'
+  external:
+    # img-src: explicit declaration for <img> tags loading presigned S3 URLs.
+    # (Forge defaults img-src to *, so this is belt-and-suspenders for forward compat.)
+    images:
+      - address: '*.amazonaws.com'
+    # media-src: required for <video> and <audio> elements loading presigned URLs.
+    media:
+      - address: '*.amazonaws.com'
+    # connect-src: required for fetch() in useTextContent (text/CSV previews).
+    fetch:
+      client:
+        - address: '*.amazonaws.com'
+      # Backend egress: required for the getFileContent resolver which uses
+      # @forge/api fetch() to download bytes from an S3 presigned
+      # URL (hosted on *.amazonaws.com) before returning them base64-encoded to
+      # the frontend. Without this, the backend fetch is blocked in deployed mode.
+      backend:
+        - address: '*.amazonaws.com'
+
+app:
+  runtime:
+    name: nodejs24.x
+    memoryMB: 256
+    architecture: arm64
+  id: ari:cloud:ecosystem::app/ed95ed2a-5bfc-413b-a263-27e9cd176f22
+  compatibility:
+    jira:
+      required: true

@@ -1,0 +1,32 @@
+{
+  "name": "project-bucket-app",
+  "version": "3.0.0",
+  "main": "index.js",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src/**/*.ts || npm run --silent hook-errors",
+    "hook-errors": "echo '\\x1b[31mThe build failed lint checks. See the eslint output above for details.\\n' && exit 1",
+    "test": "node --import tsx --test \"src/**/*.test.ts\""
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "@typescript-eslint/eslint-plugin": "^8.64.0",
+    "@typescript-eslint/parser": "^8.64.0",
+    "eslint": "^8.56.0",
+    "eslint-plugin-react-hooks": "^4.6.0",
+    "tsx": "^4.23.1",
+    "typescript": "^5.4.5"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1095.0",
+    "@aws-sdk/s3-request-presigner": "^3.1095.0",
+    "@forge/api": "^8.0.1",
+    "@forge/kvs": "^2.0.2",
+    "@forge/react": "^12.1.0",
+    "@forge/resolver": "^2.0.0",
+    "@forge/sql": "^4.0.1",
+    "@forge/teamwork-graph": "^5.0.1"
+  }
+}

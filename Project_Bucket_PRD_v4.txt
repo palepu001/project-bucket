@@ -1,0 +1,131 @@
+Project Bucket — PRD	
+PRODUCT REQUIREMENTS DOCUMENT
+Project Bucket
+1. The Problem
+As Jira projects mature, attachments accumulate fast — screenshots, logs, design files, customer uploads. Jira's built-in attachment storage is convenient but expensive at scale, and teams eventually face one of two bad options.
+	•	Pay for more storage by upgrading their whole Jira plan, even when only attachments are driving the cost.
+	•	Offload files to an external tool, which breaks the in-context experience — files stop showing up inline, stop being searchable from Jira, and stop being covered by Jira's own security model.
+Left unaddressed, growing teams either overpay for capacity they don't need, or accept search-blindness and security gaps in the tools that already try to solve this.
+2. The Market
+2.1 Competitive Landscape
+The market is not empty — two incumbents already serve this need, both listed on the Atlassian Marketplace since 2015. This is treated as validation of real, proven demand, not a reason to avoid the space.
+App
+Platform
+Storage Model
+Key Gap
+Simple Cloud Files
+Atlassian Connect (legacy)
+Per-project or per-issue bucket; admin supplies AWS credentials
+No native Jira search; no malware scanning; exposed to Connect end-of-support
+Amazon S3 Connector for Jira
+Atlassian Connect (legacy)
+Single or shared bucket; admin supplies AWS credentials
+Same search and safety gaps; static file-link experience
+Project Bucket (proposed)
+Forge — “Runs on Atlassian”
+Zero-config managed bucket, one per project
+—
+2.2 Timing: The Connect-to-Forge Shift
+Terminology note: “Atlassian Connect” is the legacy app-development framework being retired below. This is unrelated to the “Connect apps” screen under Rovo search settings (used later in F8) — that screen is Atlassian's label for its list of connected search sources. Same words, two different things.
+Atlassian confirmed the Connect retirement on 17 March 2025 and is executing it in three phases. As of this document's writing (July 2026), Atlassian's own communications describe the following, verified timeline:
+
+
+Phase
+Date
+What it means
+Phase 1
+September 2025
+No new Connect apps may be listed on the Marketplace. New entrants must build on Forge — exactly the lane Project Bucket is in.
+Phase 2
+Active since 31 March 2026
+Existing Connect apps can no longer update their descriptor — vendors can ship bug fixes, but cannot add new permissions, surfaces, or integration points. Incumbents are frozen in their current feature set.
+Phase 3
+“Sometime in Q4 2026” — no fixed date yet
+Full end-of-support. Connect apps keep technically running, but Atlassian stops patching security issues and guaranteeing compatibility. Vendors describe this as apps that “degrade over time” rather than break on a specific day.
+Two additional developments strengthen the timing case since we last reviewed this:
+	•	Starting the week of 25 May 2026, Atlassian began showing in-product banners in Jira, Confluence, and admin.atlassian.com that flag to admins exactly which installed apps still run on Connect — making the incumbents' legacy status directly visible to our prospective buyers, unprompted.
+	•	Third-party tooling (e.g. forge-apps.com) now lets any admin look up a Marketplace app and see its migration badge — red for Connect, yellow for “Connect on Forge” (partial), green for fully Forge. Neither incumbent shows any public sign of migration in progress.
+Net effect: this remains a genuine, time-boxed opening, not a one-time talking point that expires. A Forge-native entrant carries no migration debt and can lead its positioning with a real trust signal at the exact moment Atlassian itself is prompting admins to question their vendors' Forge status.
+2.3 Target Customer Segments
+Segment
+Primary Feature Driver
+Motivation
+Growing teams on Jira Standard (approx. 10–150 users)
+F1, F2, F3, F4
+Storage cost pressure; fast, credential-free onboarding
+Regulated / Premium & Enterprise buyers (healthcare, finance, JSM-heavy)
+F5, F6, F7
+Compliance, audit, and data-residency control — independent of storage capacity
+All segments
+F8
+Prevents offloaded attachments from becoming functionally invisible in search
+Note: exact Jira Standard vs. Premium storage caps are in flux and should be re-verified against Atlassian's published pricing before this segmentation is used in customer-facing messaging.
+3. Product Positioning
+Project Bucket is a Forge-native attachment offload for Jira and Jira Service Management: one managed S3-compatible bucket per project, zero AWS credentials for the customer, files that still look and behave like native Jira attachments, and full inclusion in Atlassian's own search — all running inside Atlassian's infrastructure rather than a vendor's own servers.
+Positioning line for buyers: “The attachment offload that runs on Atlassian, not next to it.”
+4. Core Features
+F1 — Project-to-Bucket Mapping
+Goal: Every Jira project gets its own dedicated S3 bucket, created automatically in the customer's AWS account the moment the project is synced — one project, one bucket, with no manual setup per project.
+User story: As a Jira admin, I want each project to get its own bucket automatically after I connect our AWS once, so that files stay isolated per project and I never have to touch S3 again.
+Client journey: Admin connects the customer's AWS once (see F4) → whenever a project is synced, Project Bucket automatically creates a dedicated bucket for it in the customer's account → that project's files route there, isolated from every other project, with clean per-project cost attribution at the bucket level.
+F2 — In-Issue Upload Button
+Goal: Uploading to Project Bucket feels identical to uploading a native Jira attachment.
+User story: As a Jira user, I want to attach a file from the normal issue view, so that I don't need to learn a separate tool or workflow.
+Client journey: User opens an issue → clicks the existing attachment control → file uploads to the project's bucket transparently.
+Placement rule: Jira surfaces its native attachment affordance wherever there is an editable text field — issue description, comments — not as a single standalone control. Project Bucket's upload button rides along at every one of those same entry points rather than introducing a new one, and is styled to stand out, not blend in, so users notice the Project Bucket option specifically.
+F3 — File Display
+Goal: Offloaded files are represented clearly, without imitating Jira's native attachment gallery.
+User story: As a Jira user, I want to see what an offloaded file is at a glance, so that I don't have to open it to know what I'm looking at.
+Client journey: User opens an issue with offloaded files → sees a flat list row per file (filename, plus a small preview snippet for image or text files) → clicks through to view or download.
+Design decision: we are not attempting to mimic Jira's native attachment thumbnail gallery. Jira only auto-generates thumbnails for files it physically stores; replicating that for offloaded files would require building a parallel thumbnail pipeline with real technical uncertainty. Instead, Project Bucket renders its own honest, legible representation — a flat list row for v1, communicating file information clearly rather than imitating a native look Forge cannot cleanly guarantee.
+
+
+F4 — AWS Connection (Connect Once)
+Goal: One AWS connection that grants Project Bucket everything it needs — creating a bucket per project, reading file metadata for search and display (F7), and generating signed links (F6) — so the admin connects once and never returns to the AWS console for per-project setup.
+User story: As a Jira admin, I want to connect our AWS account once and then forget about it, so that new projects get storage automatically and files stay searchable without me configuring anything in S3 again.
+Client journey: Admin opens Project Bucket setup → in their AWS account, creates an IAM access key with an S3 policy covering what the app needs, and pastes the access key and secret into the setup screen — the same standard S3 configuration Jira admins already know from existing S3 connectors → the app validates the credentials and shows a green “Connected” state → from then on, buckets are created automatically on project sync and file metadata flows to search, with no further trips into AWS.
+Design decision — stay on standard ground: F4 deliberately matches how existing S3-for-Jira apps are configured — admin-supplied AWS credentials entered once — rather than inventing a new setup flow. The credentials are stored encrypted, and we guide the admin to scope the IAM policy to exactly what Project Bucket needs and nothing more: create and manage buckets within our own naming namespace, read/write objects, and generate pre-signed URLs. Because we auto-create a bucket per project, that policy necessarily includes bucket-creation rights — a broader grant than plain read/write, which security-minded admins will scrutinize, so the scoping guidance matters. Project Bucket does not try to win on the connection screen; differentiation lives in F5, F6, F7 and the Forge-native footing.
+F5 — Malware & Virus Scanning
+Goal: Every file uploaded through a JSM customer portal is scanned before it becomes visible to internal staff.
+User story: As a JSM agent, I want customer-submitted attachments scanned automatically, so that external, untrusted uploads can't introduce malware into our systems.
+Client journey: External customer clicks “add attachment” and selects a file → the file is written to the project's bucket right away but lands in a “scanning” state that cannot be opened → our scan service reads it and returns a verdict → clean files flip to openable and appear normally; flagged files are quarantined (moved out / removed) and surfaced to the agent and are never openable.
+Build approach (placeholder — to be finalized on cost/scale): scanning uses ClamAV (open-source). Forge can't run a service like ClamAV natively — it allows no long-lived or native processes — so the scan runs as Project Bucket's own centrally-operated remote service (not deployed into the customer's account), invoked over Forge Remote. Running one central scanner rather than one inside each customer's AWS keeps virus-definition updates, scaling, and patching in a single place and keeps the customer's AWS grant narrow. Sequencing is store-then-scan: the file goes straight to the customer's bucket (so uploads never block on the scanner and large files avoid Forge's payload limits), and the scanner reads it transiently — never persisting a copy on our side — then writes back a clean/flagged verdict. The safety gate is that a file is un-openable until the verdict is clean, enforced for free through F6: signed links are minted on demand by our app, so the app simply won't issue a link for any file not yet marked clean. Malware at rest is inert; this gate is what guarantees a flagged file is never opened. Exact hosting is a placeholder pending cost modeling: serverless (e.g. AWS Lambda) is favored at current scale for pay-per-use economics, with a crossover to always-on compute only worth it if constant scan volume gets high. Remaining product work: flagging/severity rules (quarantine vs. outright block by file type), the agent-facing quarantine and review UX, and the scan-status field in the F3 file row.
+
+
+F6 — Expiring Signed Access Links
+Goal: Files aren't permanently, publicly reachable by a static URL.
+User story: As a security-conscious admin, I want file links to expire, so that a leaked link can't be used to access data indefinitely.
+Client journey: User clicks a file → a time-limited signed URL is generated on demand → the link stops working after expiry.
+Build approach: Uses S3's native pre-signed URL generation — a local, offline cryptographic operation with no separate token infrastructure to build. Works identically whether the bucket is provisioned by us or brought by the customer, since the signing uses the scoped role granted at connection.
+F7 — Teamwork Graph Connector (Search Integration)
+Requirement: Keep offloaded attachments visible in Jira's own (Rovo) search. Connecting Project Bucket to Rovo means files that left native storage don't disappear from search — they surface in the same search bar users already use, not in a separate side panel. Everything below is how we deliver that.
+User story: As a Jira user, I want a search from Jira's normal search bar to also surface offloaded files, so that moving files off native storage doesn't make them harder to find.
+Client journey: Admin installs Project Bucket (core product is live) → as a separate, explicit step, admin goes to Rovo settings → Apps → Connect apps and clicks “Connect” next to Project Bucket → from then on, Project Bucket's file metadata is registered into the Teamwork Graph and merges automatically into Rovo Search results, no further action per search.
+How it works: Project Bucket ships a Forge Teamwork Graph connector. Once the admin completes the Connect step above, the app is authorized to feed the org's search index, and it registers each offloaded file's metadata — filename, file type, the issue and project it belongs to, and a link — into the Teamwork Graph. It is the metadata that is indexed, not the file's contents; the file itself stays in the customer's bucket. When a user searches from Jira's Rovo search bar, Rovo queries the Teamwork Graph across every connected source, matches Project Bucket's file entries, and returns them inline alongside native Jira results; clicking one resolves to the file through a signed link (F6).
+	•	This two-step design isn't a limitation being worked around — Atlassian deliberately keeps the search-permission grant as its own explicit admin action, not something an app can trigger during install. That's a trust signal to sell: the admin, not the vendor, controls what feeds the org's search index.
+	•	Known constraint: Forge cannot inject rows into Jira's classic issue navigator page — only into Rovo's unified search surface. For orgs still on classic search, this benefit doesn't apply until they're on Rovo.
+	•	This integration reached general availability at Atlassian's Team '26 conference (May 2026) — mature, supported ground, not a bet on an early-access feature.
+	•	Durability note: Atlassian and some early-access partners are reportedly building a native Teamwork Graph connector for S3 directly. If that matures, files could reach search without an app like ours in between — but a raw S3 connector sees generic objects, not the Jira issue/project context our Forge app supplies, which is what makes a result useful inside Jira. F7's real edge is the Jira-aware metadata, not merely getting S3 into the index.
+5. Feature Prioritization
+Priority
+Features
+Rationale
+Must-have (MVP)
+F1, F2, F3, F4
+Without these, there is no product — this is the baseline offload experience. F4 is now the standard AWS connection (connect once) rather than zero-config provisioning.
+Must-have (differentiator)
+F5, F6
+What separates Project Bucket from the incumbents for the regulated/enterprise segment.
+Should-have (post-MVP)
+F7
+High value — but depends on the admin's separate post-install action.
+6. Marketplace Strategy
+Lead with the Forge-native trust signal directly against both incumbents' Connect exposure, timed to when Atlassian's own in-product banners are already raising the question for admins. Position JSM-specific security (F5, F6) plus the customer-owned storage model — files never leave the customer's own cloud — as the wedge into regulated/enterprise accounts, where the buying conversation is about compliance, data ownership, and audit posture rather than cost-per-GB.
+Because storage is now the customer's own S3, expect the “why not just wire this up ourselves?” objection. Answer it with buy-vs-build, not storage lock-in: shipping and maintaining a Forge app is a standing engineering commitment against scarce Forge talent. Project Bucket delivers the S3 connection, native display, scanning, expiring links, and search integration as a maintained product — so the customer keeps full ownership of their bucket without having to own the app.
+Pricing structure, storage limits, and overage pricing are intentionally scoped out of this document and left to business leadership.
+7. Success Metrics
+	•	Marketplace installs and trial-to-paid conversion within the first two quarters post-launch.
+	•	% of installs that successfully connect AWS, and median time-to-connect — a read on whether the F4 setup is smooth enough in practice.
+	•	% of installs that complete the F7 Rovo “Connect apps” step.
+	•	Support tickets related to missing/unsearchable attachments.
+	•	Win rate in regulated-industry evaluations where Forge-native / “Runs on Atlassian” status is an explicit vendor question.

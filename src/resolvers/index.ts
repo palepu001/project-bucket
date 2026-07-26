@@ -1,0 +1,592 @@
+import api, { route } from '@forge/api';
+import { randomUUID } from 'crypto';
+import Resolver from '@forge/resolver';
+import { FileNormalizer } from '../shared/security/normalizer';
+import { validateStateless } from '../shared/security/validators/statelessPipeline';
+import { getStorageProvider, ChecksumType } from '../storage';
+import { ObjectNotFoundError } from '../storage/ObjectNotFoundError';
+import { generateStorageKey, StorageKeyContext } from '../util/storageKey';
+import { extensionOf, AttachmentThumbnailStatus } from '../types/attachment';
+import * as attachmentRepository from '../repositories/attachmentRepository';
+import * as sessionService from '../services/sessionService';
+import * as migrationService from '../services/migrationService';
+import * as graphSyncService from '../services/graphSyncService';
+import * as storageConsistencyService from '../services/storageConsistencyService';
+
+const resolver = new Resolver();
+
+function requireAccountId(context: { accountId?: string | null }): string {
+  if (!context.accountId) {
+    throw new Error('This action requires an authenticated user.');
+  }
+  return context.accountId;
+}
+
+async function verifyIssueAccess(issueId: string): Promise<void> {
+  const response = await api.asUser().requestJira(route`/rest/api/3/issue/${issueId}?fields=id`);
+  if (!response.ok) {
+    throw new Error(`Unauthorized or missing issue ${issueId}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Gallery: list / search / filter
+// ---------------------------------------------------------------------------
+
+resolver.define('listAttachments', async (req) => {
+  const { issueId, search, extension } = req.payload as { issueId: string; search?: string; extension?: string };
+  if (!issueId) throw new Error('listAttachments requires an issueId');
+  const attachments = await attachmentRepository.listAttachments({ issueId, search, extension });
+
+  // Invariant: a file only appears in Project Bucket while its bytes exist at
+  // the storage location. Rows we cannot verify right now are HIDDEN from this
+  // response but NOT quarantined — quarantine is the hourly sweep's job, and
+  // only after a confirmed second miss, so one transient/regressed read can
+  // never destructively hide a live library. On a transient storage failure we
+  // fall back to the unverified list — the preview path degrades gracefully,
+  // and hiding live files would be worse.
+  try {
+    const { present } = await storageConsistencyService.partitionByStoredBytes(attachments);
+    return present;
+  } catch (error) {
+    console.error('[ProjectBucket] Storage existence check failed; returning unverified list:', error);
+    return attachments;
+  }
+});
+
+resolver.define('getDownloadUrl', async (req) => {
+  const { attachmentId } = req.payload as { attachmentId: string };
+  const attachment = await attachmentRepository.getAttachmentById(attachmentId);
+  if (!attachment) throw new Error(`Attachment "${attachmentId}" was not found`);
+  
+  await verifyIssueAccess(attachment.issueId);
+  try {
+    const provider = await getStorageProvider({ projectId: attachment.projectId });
+    const { url } = await provider.download(attachment.objectKey);
+    return { url, filename: attachment.filename, mimeType: attachment.mimeType, size: attachment.size };
+  } catch (err) {
+    // If the bytes are genuinely missing from the location, return a structured
+    // "unavailable" response so the frontend shows a friendly message instead
+    // of a raw error. We do NOT quarantine here — a single on-demand miss is not
+    // proof of loss; the hourly sweep owns the ACTIVE → ORPHANED decision after
+    // a confirmed second miss, so a transient read never withdraws a live file.
+    if (err instanceof ObjectNotFoundError) {
+      return { url: null, unavailable: true, filename: attachment.filename, mimeType: attachment.mimeType, size: attachment.size };
+    }
+    throw err;
+  }
+});
+
+// Mints URLs for the generated preview images the gallery grid paints, one
+// round-trip for the whole page of cards. This replaced a variant that returned
+// URLs for the ORIGINAL bytes, which meant painting a grid of photos downloaded
+// every photo at full size. Attachments without a stored rendition are simply
+// absent from the response and fall back to their file-type icon.
+resolver.define('getThumbnailUrls', async (req) => {
+  const { attachmentIds } = req.payload as { attachmentIds: string[] };
+  if (!Array.isArray(attachmentIds) || attachmentIds.length === 0) {
+    throw new Error('getThumbnailUrls requires a non-empty attachmentIds array');
+  }
+  if (attachmentIds.length > 100) {
+    throw new Error('getThumbnailUrls accepts at most 100 attachment ids per call');
+  }
+
+  const attachments = (await Promise.all(
+    attachmentIds.map((id) => attachmentRepository.getAttachmentById(id))
+  )).filter((a): a is NonNullable<typeof a> => a !== null && !!a.thumbnailKey);
+
+  const byIssue = new Map<string, typeof attachments>();
+  for (const a of attachments) {
+    if (!byIssue.has(a.issueId)) byIssue.set(a.issueId, []);
+    byIssue.get(a.issueId)!.push(a);
+  }
+
+  const urls: Record<string, string> = {};
+  for (const [issueId, issueAttachments] of byIssue.entries()) {
+    try {
+      await verifyIssueAccess(issueId);
+    } catch (err) {
+      console.warn(`[ProjectBucket] Skipping thumbnails for unauthorized/missing issue ${issueId}`);
+      continue;
+    }
+    for (const attachment of issueAttachments) {
+      try {
+        const provider = await getStorageProvider({ projectId: attachment.projectId });
+        const { url } = await provider.download(attachment.thumbnailKey!);
+        urls[attachment.id] = url;
+      } catch (err) {
+        if (err instanceof ObjectNotFoundError) continue;
+        throw err;
+      }
+    }
+  }
+  return urls;
+});
+
+// Backfill hook. Rows predating the thumbnail feature — and every migrated
+// attachment, which never passes through the upload path's generation step —
+// carry a NULL thumbnail_status. The gallery renders those in the browser on
+// first view and reports the result here. Recording UNSUPPORTED/FAILED matters
+// as much as READY: it is what stops the panel retrying a file forever.
+resolver.define('recordThumbnail', async (req) => {
+  const { attachmentId, thumbnailKey, thumbnailStatus } = req.payload as {
+    attachmentId: string;
+    thumbnailKey: string | null;
+    thumbnailStatus: AttachmentThumbnailStatus;
+  };
+  if (!attachmentId || !thumbnailStatus) {
+    throw new Error('recordThumbnail requires an attachmentId and thumbnailStatus');
+  }
+  const attachment = await attachmentRepository.getAttachmentById(attachmentId);
+  if (!attachment) throw new Error(`Attachment "${attachmentId}" was not found`);
+  await verifyIssueAccess(attachment.issueId);
+
+  await attachmentRepository.updateThumbnail(attachmentId, thumbnailKey ?? null, thumbnailStatus);
+  return { success: true };
+});
+
+// ---------------------------------------------------------------------------
+// Content proxy: returns file bytes as a base64 data-URL for previews that
+// cannot use presigned S3 URLs directly (PDF iframes need application/pdf
+// Content-Type; text/CSV fetch hits CORS since storage backend does not
+// set Access-Control-Allow-Origin on presigned GETs). Capped at 10 MB to
+// stay within Forge function response payload limits.
+// ---------------------------------------------------------------------------
+
+const MAX_PROXY_BYTES = 10 * 1024 * 1024; // 10 MB
+
+resolver.define('getFileContent', async (req) => {
+  const { attachmentId } = req.payload as { attachmentId: string };
+  const attachment = await attachmentRepository.getAttachmentById(attachmentId);
+  if (!attachment) throw new Error(`Attachment "${attachmentId}" was not found`);
+  
+  await verifyIssueAccess(attachment.issueId);
+
+  if (attachment.size > MAX_PROXY_BYTES) {
+    return { error: 'too-large', maxBytes: MAX_PROXY_BYTES };
+  }
+
+  try {
+    // Read the raw bytes from the storage location, which returns a readable
+    // reference with the full body (or null if nothing is stored at the ref).
+    const provider = await getStorageProvider({ projectId: attachment.projectId });
+    const obj = await provider.stream(attachment.objectKey);
+    if (!obj) {
+      return { error: 'not-found' };
+    }
+    // Convert the object body to a base64 string for transport to the frontend.
+    const chunks: Uint8Array[] = [];
+    if ('getReader' in obj.body) {
+      const reader = obj.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+      }
+    } else {
+      for await (const chunk of obj.body as any) {
+        chunks.push(chunk);
+      }
+    }
+    const buffer = Buffer.concat(chunks);
+    const base64 = buffer.toString('base64');
+    const mimeType = attachment.mimeType || 'application/octet-stream';
+    return { dataUrl: `data:${mimeType};base64,${base64}` };
+  } catch (err) {
+    if (err instanceof ObjectNotFoundError) {
+      return { error: 'not-found' };
+    }
+    throw err;
+  }
+});
+
+// Read-only incident diagnostic. storage backend intentionally has no bucket-wide
+// listing API, so the only reliable audit is to verify each key persisted in
+// Project Bucket's SQL metadata for this issue. This lets the UI distinguish a
+// missing object from one whose stored bytes no longer match its metadata.
+resolver.define('getStorageAudit', async (req) => {
+  const { issueId } = req.payload as { issueId: string };
+  if (!issueId) throw new Error('getStorageAudit requires an issueId');
+  
+  await verifyIssueAccess(issueId);
+
+  // Include ORPHANED rows: the audit is exactly where quarantined losses
+  // must remain visible after the gallery stops listing them.
+  const attachments = await attachmentRepository.listAttachments({ issueId, includeOrphaned: true });
+  // We cannot easily do a single exists() call if attachments span multiple projects,
+  // but they all belong to the same issue, meaning they all belong to the same project.
+  const projectId = attachments.length > 0 ? attachments[0].projectId : null;
+  const stored = projectId 
+    ? await (await getStorageProvider({ projectId })).exists(attachments.map((attachment) => attachment.objectKey))
+    : [];
+  const storedByKey = new Map(
+    stored
+      .filter((r) => r.status === 'found' && r.summary)
+      .map((r) => [r.ref, r.summary!])
+  );
+
+  return attachments.map((attachment) => {
+    const object = storedByKey.get(attachment.objectKey);
+    return {
+      attachmentId: attachment.id,
+      filename: attachment.filename,
+      objectKey: attachment.objectKey,
+      source: attachment.source,
+      status: attachment.status,
+      expectedSize: attachment.size,
+      expectedChecksum: attachment.checksum,
+      exists: Boolean(object),
+      storedSize: object?.size ?? null,
+      storedChecksum: object?.checksum ?? null,
+      metadataMatches: object
+        ? object.size === attachment.size && object.checksum === attachment.checksum
+        : false,
+    };
+  });
+});
+
+resolver.define('deleteAttachment', async (req) => {
+  const { attachmentId } = req.payload as { attachmentId: string };
+  const attachment = await attachmentRepository.getAttachmentById(attachmentId);
+  if (!attachment) throw new Error(`Attachment "${attachmentId}" was not found`);
+  
+  await verifyIssueAccess(attachment.issueId);
+
+  // Delete the object first. If this throws we normally keep the SQL row so
+  // the gallery never points at bytes we failed to remove — EXCEPT when the
+  // object is already gone (the orphaned-entry cleanup that "Remove entry" in
+  // UnavailablePreview drives): there is nothing to orphan, so removing the
+  // row is exactly right. We only re-throw when the object still exists, i.e.
+  // a genuine transient failure.
+  try {
+    const provider = await getStorageProvider({ projectId: attachment.projectId });
+    await provider.delete(attachment.objectKey);
+  } catch (err) {
+    const provider = await getStorageProvider({ projectId: attachment.projectId });
+    const [check] = await provider.exists([attachment.objectKey]);
+    const stillExists = check?.status !== 'missing';
+    if (stillExists) throw err;
+  }
+  // The generated preview image is a second object under the same row. Removing
+  // it is best-effort on purpose: the file itself is already gone by here, so
+  // failing the whole delete over a leftover thumbnail would strand the row and
+  // leave the user unable to retry. A missed thumbnail is a harmless orphan.
+  if (attachment.thumbnailKey) {
+    const provider = await getStorageProvider({ projectId: attachment.projectId });
+    await provider.delete(attachment.thumbnailKey).catch((err) => {
+      console.warn(`[ProjectBucket] Could not delete thumbnail for ${attachmentId}:`, err);
+    });
+  }
+  await attachmentRepository.deleteAttachmentRow(attachmentId);
+  // F7: remove the metadata object from Teamwork Graph. Never throws — the
+  // reconciliation sweep heals a missed delete.
+  await graphSyncService.publishDeletes([attachmentId]);
+  return { success: true };
+});
+
+// ---------------------------------------------------------------------------
+// Direct upload ("Add Attachment"): browser uploads bytes straight to Forge
+// storage backend via the @forge/bridge storage upload URL call, which is
+// wired to the 'uploadObjects' functionKey below to mint presigned URLs.
+// Metadata is only persisted afterward, once the bridge confirms success.
+// ---------------------------------------------------------------------------
+
+export interface UploadPayload {
+  filename: string;
+  size: number;
+  mimeType: string;
+  checksum: string;
+}
+
+resolver.define('uploadObjects', async (req) => {
+  const { objects, issueId, projectId } = (req.payload ?? {}) as { objects?: UploadPayload[], issueId?: string, projectId?: string };
+  if (!objects || !Array.isArray(objects)) {
+    throw new Error('uploadObjects requires an objects array');
+  }
+  if (!issueId || !projectId) {
+    throw new Error('uploadObjects requires issueId and projectId');
+  }
+  
+  // Resolve projectKey, issueKey, epicKey once per batch
+  const issueResponse = await api.asApp().requestJira(route`/rest/api/3/issue/${issueId}?fields=project,parent`);
+  const issueData = await issueResponse.json();
+  const storageContext: StorageKeyContext = {
+    cloudId: req.context.installContext.replace('ari:cloud:jira::site/', ''),
+    projectKey: issueData.fields.project.key,
+    issueKey: issueData.key,
+    epicKey: issueData.fields.parent ? issueData.fields.parent.key : null,
+  };
+  
+  const provider = await getStorageProvider({ projectId });
+
+  const results = [];
+
+  for (const obj of objects) {
+    const normalizedName = FileNormalizer.normalizeFilename(obj.filename);
+    const validation = validateStateless({ 
+      filename: normalizedName, 
+      size: obj.size, 
+      mimeType: obj.mimeType 
+    });
+
+    if (!validation.passed) {
+      // Hard block at the trust boundary. No presigned URL minted.
+      results.push({
+        success: false,
+        message: validation.message
+      });
+      continue;
+    }
+    
+    // Validation passed, prepare the upload target. No TTL is set, so the
+    // stored object persists until the user deletes it.
+    const key = generateStorageKey(storageContext);
+    const target = await provider.upload({
+      ref: key,
+      length: obj.size,
+      mimeType: obj.mimeType,
+      checksum: obj.checksum,
+      checksumType: 'SHA256',
+      overwrite: false,
+    });
+
+    results.push({ success: true, url: target.url, key, method: target.method, headers: target.headers });
+  }
+  
+  return results;
+});
+
+interface RecordAttachmentInput {
+  key: string;
+  filename: string;
+  size: number;
+  mimeType: string;
+  checksum: string;
+  // Storage handle for the preview image the browser rendered for this file,
+  // uploaded in the SAME batch as the file itself. Absent when the type cannot
+  // be rendered client-side or when rendering failed — neither is fatal.
+  thumbnailKey?: string | null;
+  thumbnailStatus?: AttachmentThumbnailStatus | null;
+  projectKey?: string | null;
+  issueKey?: string | null;
+  epicKey?: string | null;
+  storageBucket?: string | null;
+}
+
+resolver.define('recordAttachments', async (req) => {
+  const { issueId, projectId, items } = req.payload as {
+    issueId: string;
+    projectId: string;
+    items: RecordAttachmentInput[];
+  };
+  if (!issueId || !projectId || !Array.isArray(items) || items.length === 0) {
+    throw new Error('recordAttachments requires issueId, projectId, and at least one item');
+  }
+  const uploadedBy = requireAccountId(req.context);
+
+  // Verify every object actually landed in the store before trusting it —
+  // the browser reported "success", but this is the last line of defense
+  // before we treat the upload as durable and show it in the gallery.
+  const keys = items.map((item) => item.key);
+  const provider = await getStorageProvider({ projectId });
+  const stored = await provider.exists(keys);
+  const storedByKey = new Map(
+    stored
+      .filter((r) => r.status === 'found' && r.summary)
+      .map((r) => [r.ref, r.summary!])
+  );
+
+  const issueResponse = await api.asApp().requestJira(route`/rest/api/3/issue/${issueId}?fields=project,parent`);
+  const issueData = await issueResponse.json();
+  const hierarchy = {
+    projectKey: issueData.fields.project.key,
+    issueKey: issueData.key,
+    epicKey: issueData.fields.parent ? issueData.fields.parent.key : null,
+  };
+  const storageBucket = (provider as any).bucket || (provider as any).bucketName;
+
+  // Verify EVERY item before persisting ANY of them. This loop used to insert
+  // as it went and throw on the first bad item, which committed the rows before
+  // it and abandoned the rest — a half-recorded upload. Verification is now a
+  // pure pass that collects failures, so the write below is all-or-nothing.
+  const now = new Date().toISOString();
+  const created = [];
+  for (const item of items) {
+    const summaryCheck = stored.find(r => r.ref === item.key);
+    if (summaryCheck?.status === 'error') {
+      throw new Error(`Upload verification failed for "${item.filename}" due to a transient storage error. Please retry.`);
+    }
+    const summary = storedByKey.get(item.key);
+    if (!summary || summary.size !== item.size) {
+      throw new Error(`Upload verification failed for "${item.filename}" — object was not found in storage`);
+    }
+    const attachment = {
+      id: randomUUID(),
+      issueId,
+      projectId,
+      filename: item.filename,
+      extension: extensionOf(item.filename),
+      mimeType: item.mimeType || 'application/octet-stream',
+      size: item.size,
+      checksum: item.checksum,
+      objectKey: item.key,
+      uploadedBy,
+      uploadedAt: now,
+      lastModified: now,
+      status: 'ACTIVE' as const,
+      syncStatus: 'READY' as const,
+      source: 'PROJECT_BUCKET_UPLOAD' as const,
+      jiraAttachmentId: null,
+      thumbnailKey: item.thumbnailKey ?? null,
+      thumbnailStatus: item.thumbnailStatus ?? null,
+      projectKey: hierarchy.projectKey,
+      issueKey: hierarchy.issueKey,
+      epicKey: hierarchy.epicKey,
+      storageBucket,
+    };
+    created.push(attachment);
+  }
+
+  // One upload action, one statement — see insertAttachments for why this must
+  // not become a per-item loop again.
+  await attachmentRepository.insertAttachments(created);
+  // F7: publish the new metadata into Teamwork Graph. Must never fail the
+  // upload — publishAttachments catches and logs internally, and the
+  // reconciliation sweep heals anything missed.
+  await graphSyncService.publishAttachments(created);
+  return created;
+});
+
+// ---------------------------------------------------------------------------
+// Bulk detection: polled by static/attachment-watcher
+// ---------------------------------------------------------------------------
+
+resolver.define('pollPendingSession', async (req) => {
+  const { issueId } = req.payload as { issueId: string };
+  if (!issueId) throw new Error('pollPendingSession requires an issueId');
+  
+  const session = await sessionService.pollForNotifiableSession(issueId);
+  if (!session) return null;
+
+  try {
+    // Instead of trusting only the items that happened to arrive before the quiet
+    // window closed, we actively sweep the issue for ALL native attachments.
+    // Because successful migrations delete the native copy, any attachment
+    // remaining on the issue is, by definition, unmigrated.
+    const response = await api.asUser().requestJira(route`/rest/api/3/issue/${issueId}?fields=attachment`);
+    if (response.ok) {
+      const issue = await response.json();
+      const nativeAttachments = issue.fields.attachment || [];
+      if (nativeAttachments.length > 0) {
+        session.items = nativeAttachments.map((a: any) => ({
+          id: randomUUID(),
+          sessionId: session.id,
+          jiraAttachmentId: a.id,
+          filename: a.filename,
+          size: a.size,
+          mimeType: a.mimeType,
+          authorAccountId: a.author?.accountId || 'unknown',
+          detectedAt: new Date().toISOString(),
+        }));
+      }
+    }
+  } catch (error) {
+    console.warn(`[ProjectBucket] Failed to sweep native attachments for session ${session.id}:`, error);
+  }
+
+  return session;
+});
+
+resolver.define('dismissSession', async (req) => {
+  const { sessionId } = req.payload as { sessionId: string };
+  if (!sessionId) throw new Error('dismissSession requires a sessionId');
+  await sessionService.dismissSession(sessionId);
+  return { success: true };
+});
+
+// ---------------------------------------------------------------------------
+// Migration pipeline: driven step-by-step by the browser (see
+// services/migrationService.ts for why), called from static/attachment-watcher
+// after "Link All" is confirmed, and from the panel's diagnostics tab for
+// "Retry failed attachment".
+// ---------------------------------------------------------------------------
+
+resolver.define('beginMigration', async (req) => {
+  const { issueId, projectId, sessionId, items } = req.payload as {
+    issueId: string;
+    projectId: string;
+    sessionId: string | null;
+    items: { jiraAttachmentId: string; filename: string }[];
+  };
+  if (!issueId || !projectId || !Array.isArray(items) || items.length === 0) {
+    throw new Error('beginMigration requires issueId, projectId, and at least one item');
+  }
+  const triggeredBy = requireAccountId(req.context);
+  return migrationService.beginMigration({ issueId, projectId, sessionId: sessionId ?? null, triggeredBy, items });
+});
+
+resolver.define('getMigrationUploadTarget', async (req) => {
+  const { migrationId, itemId, length, checksum, checksumType } = req.payload as {
+    migrationId: string;
+    itemId: string;
+    length: number;
+    checksum: string;
+    checksumType: ChecksumType;
+  };
+  const cloudId = req.context.installContext.replace('ari:cloud:jira::site/', '');
+  return migrationService.getUploadTarget({ migrationId, itemId, length, checksum, checksumType, cloudId });
+});
+
+// PHASE 1: record that one item's bytes are verified in storage backend. Does not
+// persist an attachment or touch the native Jira copy — see migrationService.
+resolver.define('stageMigrationItem', async (req) => {
+  const { migrationId, itemId, objectKey, mimeType, size, checksum } = req.payload as {
+    migrationId: string;
+    itemId: string;
+    objectKey: string;
+    mimeType: string;
+    size: number;
+    checksum: string;
+  };
+  // Require an authenticated user here too: only the eventual committer's
+  // identity matters for the persisted attachment, but staging is a
+  // user-initiated action and should never run unauthenticated.
+  requireAccountId(req.context);
+  return migrationService.stageMigrationItem({ migrationId, itemId, objectKey, mimeType, size, checksum });
+});
+
+resolver.define('failMigrationItem', async (req) => {
+  const { migrationId, itemId, error } = req.payload as { migrationId: string; itemId: string; error: string };
+  await migrationService.failMigrationItem({ migrationId, itemId, error });
+  return { success: true };
+});
+
+// The client saw a definitive 404 downloading an item's content — the native
+// attachment was deleted before it could be linked. The service re-verifies
+// against Jira before withdrawing the item from the session's transaction.
+resolver.define('skipMissingMigrationItem', async (req) => {
+  const { migrationId, itemId } = req.payload as { migrationId: string; itemId: string };
+  requireAccountId(req.context);
+  return migrationService.skipMissingMigrationItem({ migrationId, itemId });
+});
+
+// PHASE 2: the transaction boundary — commit the whole session at once (persist
+// every attachment, then delete every native copy), or abort touching nothing.
+resolver.define('commitMigrationRun', async (req) => {
+  const { migrationId } = req.payload as { migrationId: string };
+  const actorAccountId = requireAccountId(req.context);
+  return migrationService.commitMigrationRun({ migrationId, actorAccountId });
+});
+
+resolver.define('retryMigration', async (req) => {
+  const { migrationId } = req.payload as { migrationId: string };
+  return migrationService.prepareRetry(migrationId);
+});
+
+resolver.define('getMigrationDiagnostics', async (req) => {
+  const { issueId } = req.payload as { issueId: string };
+  if (!issueId) throw new Error('getMigrationDiagnostics requires an issueId');
+  return migrationService.listMigrationRunsForIssue(issueId);
+});
+
+export const handler = resolver.getDefinitions();

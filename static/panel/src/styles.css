@@ -1,0 +1,717 @@
+:root {
+  color-scheme: light;
+  --pb-blue: #0052cc;
+  --pb-red: #de350b;
+  --pb-gray-50: #f4f5f7;
+  --pb-gray-200: #dfe1e6;
+  --pb-gray-500: #6b778c;
+  --pb-gray-900: #172b4d;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  color: var(--pb-gray-900);
+  font-size: 14px;
+}
+
+.pb-app {
+  padding: 12px 16px 24px;
+}
+
+/* One chrome row: tabs on the left, the add-attachment action on the right.
+   The tabs' bottom rule spans the whole row so the button sits on the same
+   baseline, matching how Jira lays out section headers. */
+.pb-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 2px solid var(--pb-gray-200);
+  margin-bottom: 12px;
+}
+
+.pb-button {
+  border: 1px solid transparent;
+  border-radius: 3px;
+  padding: 6px 12px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  background: var(--pb-gray-50);
+  color: var(--pb-gray-900);
+}
+
+.pb-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.pb-button-primary {
+  background: var(--pb-blue);
+  color: white;
+}
+
+.pb-button-primary:hover:not(:disabled) {
+  background: #0065ff;
+}
+
+.pb-button-primary:active:not(:disabled) {
+  background: #0747a6;
+}
+
+/* ADS spotlight-pulse treatment (the same expanding ring Atlassian's own
+   onboarding uses) to draw the eye to the panel's headline action. The ring
+   stops the moment the user engages with the button — once they've noticed
+   it, continuing to pulse would just be noise. */
+.pb-button-pulse {
+  animation: pb-pulse 2.4s ease-out infinite;
+}
+
+.pb-button-pulse:hover,
+.pb-button-pulse:focus,
+.pb-button-pulse:disabled {
+  animation: none;
+}
+
+@keyframes pb-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(0, 82, 204, 0.55);
+  }
+  55% {
+    box-shadow: 0 0 0 9px rgba(0, 82, 204, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(0, 82, 204, 0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pb-button-pulse {
+    animation: none;
+  }
+}
+
+.pb-button-subtle {
+  background: transparent;
+  border-color: var(--pb-gray-200);
+}
+
+.pb-button-danger {
+  background: transparent;
+  color: var(--pb-red);
+  border-color: var(--pb-red);
+}
+
+.pb-tabs {
+  display: flex;
+  gap: 4px;
+}
+
+.pb-tab {
+  border: none;
+  background: transparent;
+  padding: 8px 4px;
+  margin-right: 16px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--pb-gray-500);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -2px;
+}
+
+.pb-tab-active {
+  color: var(--pb-blue);
+  border-bottom-color: var(--pb-blue);
+}
+
+.pb-toolbar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.pb-search {
+  padding: 6px 10px;
+  border: 1px solid var(--pb-gray-200);
+  border-radius: 3px;
+  font-size: 13px;
+}
+
+.pb-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.pb-chip {
+  border: 1px solid var(--pb-gray-200);
+  background: white;
+  border-radius: 12px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  color: var(--pb-gray-500);
+}
+
+.pb-chip-active {
+  background: var(--pb-blue);
+  border-color: var(--pb-blue);
+  color: white;
+}
+
+/* Gallery tiles, modelled on Jira's native attachment cards: a fixed-height
+   thumbnail strip, a two-line footer (name + date), and hover-only actions.
+   All other metadata lives in the tooltip so the grid stays quiet. */
+.pb-gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 8px;
+}
+
+.pb-card {
+  position: relative;
+  border: 1px solid var(--pb-gray-200);
+  border-radius: 3px;
+  background: white;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  transition: box-shadow 0.1s ease;
+}
+
+.pb-card:hover {
+  box-shadow: 0 1px 3px rgba(9, 30, 66, 0.25);
+}
+
+.pb-card-preview {
+  border: none;
+  padding: 0;
+  width: 100%;
+  height: 96px;
+  background: var(--pb-gray-50);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  overflow: hidden;
+}
+
+.pb-card-thumb {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.pb-card-footer {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 6px 8px 8px;
+  border-top: 1px solid var(--pb-gray-200);
+}
+
+.pb-card-name {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--pb-gray-900);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pb-card-date {
+  font-size: 11px;
+  color: var(--pb-gray-500);
+}
+
+/* Hover-only overlay actions, floating over the thumbnail like Jira's own
+   cards. focus-within keeps them reachable by keyboard. */
+.pb-card-actions {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.1s ease;
+}
+
+.pb-card:hover .pb-card-actions,
+.pb-card:focus-within .pb-card-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.pb-icon-button {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.95);
+  box-shadow: 0 1px 2px rgba(9, 30, 66, 0.25);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: var(--pb-gray-500);
+}
+
+.pb-icon-button:hover {
+  background: white;
+  color: var(--pb-gray-900);
+}
+
+.pb-icon-button-danger:hover {
+  color: var(--pb-red);
+}
+
+/* The only status treatment on a card: a small attention dot for the states
+   the user must act on (SYNC_ERROR / QUARANTINED). Healthy files show
+   nothing — "Ready" is the expected case, not information. */
+.pb-card-warning {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #ff8b00;
+  color: white;
+  font-size: 11px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: help;
+}
+
+.pb-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 48px 16px;
+  text-align: center;
+  color: var(--pb-gray-500);
+}
+
+.pb-state-detail {
+  font-size: 12px;
+}
+
+.pb-state-error {
+  color: var(--pb-red);
+}
+
+.pb-spinner {
+  width: 24px;
+  height: 24px;
+  border: 3px solid var(--pb-gray-200);
+  border-top-color: var(--pb-blue);
+  border-radius: 50%;
+  animation: pb-spin 0.8s linear infinite;
+}
+
+@keyframes pb-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.pb-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(9, 30, 66, 0.54);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.pb-modal {
+  background: white;
+  border-radius: 4px;
+  padding: 16px;
+  max-width: 90vw;
+  max-height: 90vh;
+  overflow: auto;
+}
+
+.pb-modal-small {
+  width: 360px;
+}
+
+.pb-modal-large {
+  width: min(900px, 90vw);
+  height: min(700px, 85vh);
+  display: flex;
+  flex-direction: column;
+}
+
+.pb-modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.pb-modal-header h3 {
+  margin: 0;
+  font-size: 14px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pb-modal-header-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.pb-modal-preview-body {
+  flex: 1;
+  overflow: auto;
+  display: flex;
+  min-height: 0;
+}
+
+.pb-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.pb-image-preview {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+}
+
+.pb-image-preview-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.pb-image-preview-scale {
+  font-size: 12px;
+  color: var(--pb-gray-500);
+}
+
+.pb-image-preview-viewport {
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--pb-gray-50);
+}
+
+.pb-image-preview-viewport img {
+  max-width: 100%;
+  max-height: 100%;
+  transition: transform 0.05s linear;
+  user-select: none;
+}
+
+.pb-pdf-preview {
+  width: 100%;
+  height: 100%;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  overflow: auto;
+}
+
+.pb-pdf-canvas {
+  max-width: 100%;
+}
+
+.pb-pdf-nav {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0;
+}
+
+.pb-video-preview,
+.pb-audio-preview {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.pb-video-preview {
+  max-height: 100%;
+}
+
+.pb-csv-preview {
+  width: 100%;
+  overflow: auto;
+}
+
+.pb-csv-preview table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 12px;
+}
+
+.pb-csv-preview th,
+.pb-csv-preview td {
+  border: 1px solid var(--pb-gray-200);
+  padding: 4px 8px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.pb-csv-preview th {
+  background: var(--pb-gray-50);
+  position: sticky;
+  top: 0;
+}
+
+.pb-plain-text-preview {
+  width: 100%;
+  margin: 0;
+  padding: 12px;
+  background: var(--pb-gray-50);
+  overflow: auto;
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.pb-office-preview {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 8px;
+  margin: auto;
+  padding: 24px;
+}
+
+.pb-office-preview h4 {
+  margin: 0;
+}
+
+.pb-office-preview-meta {
+  display: grid;
+  grid-template-columns: auto auto;
+  gap: 2px 12px;
+  font-size: 12px;
+  color: var(--pb-gray-500);
+}
+
+.pb-office-preview-meta dt {
+  font-weight: 600;
+}
+
+.pb-office-preview-meta dd {
+  margin: 0;
+  text-align: left;
+}
+
+.pb-diagnostics {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.pb-migration-run {
+  border: 1px solid var(--pb-gray-200);
+  border-radius: 4px;
+  padding: 12px;
+}
+
+.pb-migration-run-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+.pb-status-pill {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: var(--pb-gray-50);
+  color: var(--pb-gray-500);
+}
+
+.pb-status-completed {
+  background: #e3fcef;
+  color: #00875a;
+}
+
+.pb-status-partial_failure {
+  background: #fffae6;
+  color: #ff8b00;
+}
+
+.pb-status-failed {
+  background: #ffebe6;
+  color: var(--pb-red);
+}
+
+.pb-status-running {
+  background: #deebff;
+  color: var(--pb-blue);
+}
+
+.pb-migration-run-counts {
+  display: flex;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--pb-gray-500);
+  margin-bottom: 4px;
+}
+
+.pb-migration-run-times {
+  margin-bottom: 8px;
+}
+
+.pb-migration-file-list {
+  list-style: none;
+  margin: 0 0 8px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+}
+
+.pb-migration-file-list li {
+  display: flex;
+  gap: 6px;
+}
+
+.pb-file-ok span:first-child {
+  color: #00875a;
+}
+
+.pb-file-failed span:first-child {
+  color: var(--pb-red);
+}
+
+/* Unavailable-preview: shown when the file's bytes are no longer in the
+   store. Matches the office-preview layout but with a muted warning tone. */
+.pb-unavailable-preview {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 8px;
+  margin: auto;
+  padding: 24px;
+}
+
+.pb-unavailable-preview h4 {
+  margin: 0;
+  color: var(--pb-gray-900);
+}
+
+.pb-unavailable-icon {
+  opacity: 0.4;
+}
+
+/* Storage-audit: an incident-facing, read-only comparison of the attachment
+   metadata recorded by Project Bucket with the object currently returned by
+   Forge Object Store. A horizontal wrapper keeps long opaque keys readable
+   without forcing every filename column to become impractically narrow. */
+.pb-storage-audit {
+  margin-bottom: 20px;
+  padding: 16px;
+  border: 1px solid var(--pb-border);
+  border-radius: 6px;
+  background: var(--pb-gray-50);
+}
+
+.pb-storage-audit-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+
+.pb-storage-audit-heading h3 {
+  margin: 0 0 4px;
+}
+
+.pb-storage-audit-heading p {
+  margin: 0;
+}
+
+.pb-storage-audit-table-wrap {
+  overflow-x: auto;
+}
+
+.pb-storage-audit-table {
+  width: 100%;
+  min-width: 760px;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.pb-storage-audit-table th,
+.pb-storage-audit-table td {
+  padding: 8px;
+  border-top: 1px solid var(--pb-border);
+  text-align: left;
+  vertical-align: top;
+}
+
+.pb-storage-audit-table th {
+  color: var(--pb-gray-500);
+  font-weight: 600;
+}
+
+.pb-storage-audit-table code {
+  font-size: 11px;
+  word-break: break-all;
+}
+
+.pb-storage-audit-source {
+  display: block;
+  margin-top: 3px;
+  color: var(--pb-gray-500);
+}
+
+.pb-storage-audit-status {
+  display: inline-block;
+  border-radius: 999px;
+  padding: 2px 7px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.pb-storage-audit-status-ok {
+  color: #006644;
+  background: #e3fcef;
+}
+
+.pb-storage-audit-status-error,
+.pb-storage-audit-error {
+  color: #bf2600;
+}
+
+.pb-storage-audit-status-error {
+  background: #ffebe6;
+}

@@ -1,0 +1,22 @@
+{
+  "name": "project-bucket-attachment-watcher",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "npm run typecheck && node build.js"
+  },
+  "dependencies": {
+    "@forge/bridge": "^6.1.0",
+    "pdfjs-dist": "^6.1.200"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "esbuild": "^0.28.1",
+    "typescript": "^5.4.5"
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true,
+    "iframe-resizer@4.4.5": true
+  }
+}
