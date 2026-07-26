@@ -9,41 +9,78 @@ import {
   getProjectBucketStatus,
 } from '../services/storageConfigService';
 
-const providerCache = new Map<string, AttachmentStorageProvider>();
+// Providers are cached because building one costs two KVS reads (mode +
+// credentials) and an S3Client construction, and a single gallery load asks for
+// one per attachment.
+//
+// The cache is TIME-BOUNDED rather than permanent. An admin who rotates
+// credentials or re-provisions a bucket must not keep hitting the old location
+// from a warm container, and Forge gives no cross-container invalidation
+// signal, so a short TTL is what actually bounds the staleness everywhere.
+// clearStorageProviderCache() additionally makes the change instant on the
+// container that served the admin's own save.
+const PROVIDER_TTL_MS = 60_000;
+
+interface CacheEntry {
+  provider: AttachmentStorageProvider;
+  expiresAt: number;
+}
+
+const providerCache = new Map<string, CacheEntry>();
+
+function cached(key: string): AttachmentStorageProvider | null {
+  const entry = providerCache.get(key);
+  if (!entry) return null;
+  if (Date.now() >= entry.expiresAt) {
+    providerCache.delete(key);
+    return null;
+  }
+  return entry.provider;
+}
+
+function remember(key: string, provider: AttachmentStorageProvider): AttachmentStorageProvider {
+  providerCache.set(key, { provider, expiresAt: Date.now() + PROVIDER_TTL_MS });
+  return provider;
+}
+
+/**
+ * Drops every cached provider. Called by the storage admin resolvers after any
+ * write that changes where bytes should go (credentials, mode, provisioning),
+ * so the admin's next action uses the new configuration immediately instead of
+ * waiting out the TTL.
+ */
+export function clearStorageProviderCache(): void {
+  providerCache.clear();
+}
 
 export async function getStorageProvider(ctx: { projectId: string }): Promise<AttachmentStorageProvider> {
   const mode = await getStorageMode();
 
   if (mode === 'INSTANCE') {
-    if (providerCache.has('INSTANCE')) {
-      return providerCache.get('INSTANCE')!;
-    }
+    const hit = cached('INSTANCE');
+    if (hit) return hit;
+
     const creds = await getInstanceCredentials();
     const bucketStatus = await getInstanceBucketStatus();
-    
+
     if (!creds || !bucketStatus || bucketStatus.status !== 'PROVISIONED') {
       throw new StorageNotConfiguredError('Instance storage is not fully configured or provisioned.');
     }
-    
-    const provider = new S3StorageProvider(creds, bucketStatus.name);
-    providerCache.set('INSTANCE', provider);
-    return provider;
+
+    return remember('INSTANCE', new S3StorageProvider(creds, bucketStatus.name));
   } else {
     const cacheKey = `PROJECT_${ctx.projectId}`;
-    if (providerCache.has(cacheKey)) {
-      return providerCache.get(cacheKey)!;
-    }
-    
+    const hit = cached(cacheKey);
+    if (hit) return hit;
+
     const creds = await getProjectCredentials(ctx.projectId);
     const bucketStatus = await getProjectBucketStatus(ctx.projectId);
-    
+
     if (!creds || !bucketStatus || bucketStatus.status !== 'PROVISIONED') {
       throw new StorageNotConfiguredError(`Project storage is not fully configured or provisioned for project ${ctx.projectId}.`);
     }
-    
-    const provider = new S3StorageProvider(creds, bucketStatus.name);
-    providerCache.set(cacheKey, provider);
-    return provider;
+
+    return remember(cacheKey, new S3StorageProvider(creds, bucketStatus.name));
   }
 }
 

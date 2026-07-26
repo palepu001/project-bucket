@@ -176,17 +176,38 @@ const ATTACHMENTS_STORAGE_KEY_COLUMNS: { name: string; addColumnDdl: string }[] 
 ];
 const V013_MIGRATION_NAME = 'v013_add_attachments_storage_keys';
 
-async function reconcileAttachmentsStorageKeys(): Promise<void> {
+// Carries the preview rendition a migration client generates from the Jira
+// bytes across the stage → commit boundary. Without these the client uploaded a
+// thumbnail, handed back its key, and the commit dropped it on the floor —
+// leaving an unreferenced object in the bucket forever and forcing the gallery
+// to re-render the same image through the backfill path.
+const MIGRATION_ITEM_THUMBNAIL_COLUMNS: { name: string; addColumnDdl: string }[] = [
+  { name: 'thumbnail_key', addColumnDdl: 'ALTER TABLE migration_items ADD COLUMN thumbnail_key VARCHAR(500) NULL' },
+  { name: 'thumbnail_status', addColumnDdl: 'ALTER TABLE migration_items ADD COLUMN thumbnail_status VARCHAR(16) NULL' },
+];
+const V014_MIGRATION_NAME = 'v014_add_migration_items_thumbnail';
+
+/**
+ * Idempotent ALTER ... ADD COLUMN, checkpointed exactly like migrationRunner
+ * would. Used INSTEAD of migrationRunner.enqueue for every column addition —
+ * see the v013 note above for why the runner's two-round-trip checkpoint can
+ * permanently wedge an ALTER-based migration.
+ */
+async function reconcileAddedColumns(
+  migrationName: string,
+  table: string,
+  columns: { name: string; addColumnDdl: string }[]
+): Promise<void> {
   const checkpoint = await sql
     .prepare('SELECT 1 FROM __migrations WHERE name = ?')
-    .bindParams(V013_MIGRATION_NAME)
+    .bindParams(migrationName)
     .execute();
   if ((checkpoint.rows as unknown[]).length > 0) return;
 
-  const existingColumns = await sql.executeDDL('SHOW COLUMNS FROM attachments');
+  const existingColumns = await sql.executeDDL(`SHOW COLUMNS FROM ${table}`);
   const existingNames = new Set((existingColumns.rows as { Field: string }[]).map((row) => row.Field));
 
-  for (const column of ATTACHMENTS_STORAGE_KEY_COLUMNS) {
+  for (const column of columns) {
     if (existingNames.has(column.name)) continue;
     try {
       await sql.executeDDL(column.addColumnDdl);
@@ -198,7 +219,7 @@ async function reconcileAttachmentsStorageKeys(): Promise<void> {
     }
   }
 
-  await sql.prepare('INSERT INTO __migrations (name) VALUES (?)').bindParams(V013_MIGRATION_NAME).execute();
+  await sql.prepare('INSERT INTO __migrations (name) VALUES (?)').bindParams(migrationName).execute();
 }
 
 const migrations = migrationRunner
@@ -217,5 +238,6 @@ const migrations = migrationRunner
 
 export async function applySchemaMigrations(): Promise<void> {
   await migrations.run();
-  await reconcileAttachmentsStorageKeys();
+  await reconcileAddedColumns(V013_MIGRATION_NAME, 'attachments', ATTACHMENTS_STORAGE_KEY_COLUMNS);
+  await reconcileAddedColumns(V014_MIGRATION_NAME, 'migration_items', MIGRATION_ITEM_THUMBNAIL_COLUMNS);
 }

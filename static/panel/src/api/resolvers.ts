@@ -34,8 +34,21 @@ export interface DownloadUrlResult {
   unavailable?: boolean;
 }
 
-export function getDownloadUrl(attachmentId: string): Promise<DownloadUrlResult> {
-  return callResolver('getDownloadUrl', { attachmentId });
+/**
+ * `disposition` picks what the minted URL does when the browser loads it:
+ *   'inline'     (default) — render it, for the preview surfaces.
+ *   'attachment'           — save it under the attachment's real filename.
+ *
+ * The browser cannot make this choice itself: an `<a download>` hint only
+ * applies to same-origin URLs, and the storage location is always cross-origin
+ * to this iframe. So the Download action must ask for 'attachment' and let the
+ * storage location set Content-Disposition.
+ */
+export function getDownloadUrl(
+  attachmentId: string,
+  disposition: 'inline' | 'attachment' = 'inline'
+): Promise<DownloadUrlResult> {
+  return callResolver('getDownloadUrl', { attachmentId, disposition });
 }
 
 // A read-only comparison between the SQL metadata for this issue and the

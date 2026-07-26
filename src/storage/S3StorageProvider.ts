@@ -9,6 +9,7 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import {
   AttachmentStorageProvider,
   ByteStream,
+  DownloadOptions,
   ExistenceResult,
   UploadRequest,
   UploadTarget,
@@ -18,9 +19,23 @@ import { mapSettledWithConcurrency } from '../util/concurrency';
 import { ObjectNotFoundError } from './ObjectNotFoundError';
 import { StorageCredentials } from '../services/storageConfigService';
 
+/**
+ * Builds a Content-Disposition value that survives non-ASCII filenames.
+ * RFC 6266: `filename` carries an ASCII-only fallback for old clients and
+ * `filename*` (RFC 5987) carries the real UTF-8 name. Quotes and backslashes
+ * are stripped from the fallback so they cannot terminate the quoted-string
+ * early and let a crafted filename inject extra header parameters.
+ */
+export function contentDispositionFor(filename: string): string {
+  const asciiFallback = filename.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
+  return `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodeURIComponent(filename)}`;
+}
+
 export class S3StorageProvider implements AttachmentStorageProvider {
   private s3: S3Client;
-  private bucket: string;
+  // Public and readonly: recorded into each attachment's `storage_bucket`
+  // column via the containerName contract.
+  public readonly containerName: string;
 
   constructor(creds: StorageCredentials, bucketName: string) {
     this.s3 = new S3Client({
@@ -30,7 +45,11 @@ export class S3StorageProvider implements AttachmentStorageProvider {
         secretAccessKey: creds.secretAccessKey,
       },
     });
-    this.bucket = bucketName;
+    this.containerName = bucketName;
+  }
+
+  private get bucket(): string {
+    return this.containerName;
   }
 
   async upload(request: UploadRequest): Promise<UploadTarget> {
@@ -55,7 +74,7 @@ export class S3StorageProvider implements AttachmentStorageProvider {
     };
   }
 
-  async download(ref: string): Promise<ViewUrl> {
+  async download(ref: string, options?: DownloadOptions): Promise<ViewUrl> {
     try {
       await this.s3.send(new HeadObjectCommand({ Bucket: this.bucket, Key: ref }));
     } catch (error: any) {
@@ -65,7 +84,18 @@ export class S3StorageProvider implements AttachmentStorageProvider {
       throw error;
     }
 
-    const command = new GetObjectCommand({ Bucket: this.bucket, Key: ref });
+    // ResponseContentDisposition is signed into the presigned URL as a query
+    // parameter, so S3 itself returns the header and the browser saves the file
+    // under its real name. Doing this client-side is not an option: `<a
+    // download>` is ignored for cross-origin URLs, which every presigned S3 URL
+    // is relative to the Forge iframe.
+    const command = new GetObjectCommand({
+      Bucket: this.bucket,
+      Key: ref,
+      ...(options?.downloadFilename
+        ? { ResponseContentDisposition: contentDispositionFor(options.downloadFilename) }
+        : {}),
+    });
     const url = await getSignedUrl(this.s3, command, { expiresIn: 3600 });
     return { url };
   }

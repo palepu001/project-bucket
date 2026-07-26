@@ -158,6 +158,20 @@ function skippedNote(run: MigrationRun): string {
     : ` ${skipped.length} files were skipped — they were no longer in Jira: ${names}. Please check those files if you still need them.`;
 }
 
+// Names the files that failed validation and were therefore NOT moved. This has
+// to be said out loud: the run still reports success, the file is silently
+// absent from Project Bucket, and the only reason nothing was lost is that we
+// deliberately left the native Jira copy in place. The user needs to know which
+// files those are and that they are still in Jira.
+function blockedNote(run: MigrationRun): string {
+  const blocked = run.items.filter((item) => item.status === 'BLOCKED');
+  if (blocked.length === 0) return '';
+  const names = blocked.map((item) => item.filename).join(', ');
+  return blocked.length === 1
+    ? ` ${names} was not moved — its file type is not allowed in Project Bucket. It is still attached to this issue in Jira.`
+    : ` ${blocked.length} files were not moved — their file types are not allowed in Project Bucket: ${names}. They are still attached to this issue in Jira.`;
+}
+
 // Tracks the current summary flag so the retry action can close it before
 // presenting the updated result. Without this, Forge would stack two flags
 // (the old one and the new one) because showFlag is fire-and-forget.
@@ -223,7 +237,7 @@ async function presentSummaryFlag(context: WatcherContext, run: MigrationRun): P
         run.migratedCount === 1 ? 'file is' : 'files are'
       } safe in Project Bucket, but ${lingering} native Jira ${
         lingering === 1 ? 'copy' : 'copies'
-      } could not be removed. Retry to remove ${lingering === 1 ? 'it' : 'them'}.${skippedNote(run)}`,
+      } could not be removed. Retry to remove ${lingering === 1 ? 'it' : 'them'}.${skippedNote(run)}${blockedNote(run)}`,
       isAutoDismiss: false,
       actions: [retryAction],
     });
@@ -231,26 +245,31 @@ async function presentSummaryFlag(context: WatcherContext, run: MigrationRun): P
   }
 
   if (run.migratedCount === 0) {
-    // COMPLETED with nothing migrated: every source in the session had
-    // already been deleted from Jira before it could be linked.
+    // COMPLETED with nothing migrated: every item in the session was withdrawn,
+    // because its source had already been deleted from Jira or because it
+    // failed validation. Nothing was lost either way.
+    const note = `${skippedNote(run)}${blockedNote(run)}`.trim();
     activeSummaryFlag = await showFlag({
       id: `pb-migration-summary-${run.id}`,
       title: 'Nothing left to link',
-      type: 'info',
-      description: skippedNote(run).trim() || 'The detected attachments were already deleted from Jira before linking.',
+      type: blockedNote(run) ? 'warning' : 'info',
+      description: note || 'The detected attachments were already deleted from Jira before linking.',
       isAutoDismiss: false,
     });
     return;
   }
 
+  // A run that left files behind is not an unqualified success, so it neither
+  // reads as one nor auto-dismisses before the user can read why.
+  const blocked = blockedNote(run);
   activeSummaryFlag = await showFlag({
     id: `pb-migration-summary-${run.id}`,
-    title: 'Linked to Project Bucket',
-    type: 'success',
-    description: `All ${run.migratedCount} ${
+    title: blocked ? 'Linked to Project Bucket, with exceptions' : 'Linked to Project Bucket',
+    type: blocked ? 'warning' : 'success',
+    description: `${run.migratedCount} ${
       run.migratedCount === 1 ? 'attachment' : 'attachments'
-    } migrated and removed from Jira.${skippedNote(run)}`,
-    isAutoDismiss: true,
+    } migrated and removed from Jira.${skippedNote(run)}${blocked}`,
+    isAutoDismiss: !blocked,
   });
 }
 

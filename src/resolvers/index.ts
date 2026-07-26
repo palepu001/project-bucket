@@ -6,6 +6,7 @@ import { validateStateless } from '../shared/security/validators/statelessPipeli
 import { getStorageProvider, ChecksumType } from '../storage';
 import { ObjectNotFoundError } from '../storage/ObjectNotFoundError';
 import { generateStorageKey, StorageKeyContext } from '../util/storageKey';
+import { mapSettledWithConcurrency } from '../util/concurrency';
 import { extensionOf, AttachmentThumbnailStatus } from '../types/attachment';
 import * as attachmentRepository from '../repositories/attachmentRepository';
 import * as sessionService from '../services/sessionService';
@@ -54,15 +55,29 @@ resolver.define('listAttachments', async (req) => {
   }
 });
 
+// `disposition` decides whether the minted URL renders the bytes or saves them:
+//   'inline'     (default) — preview surfaces: <img>, <video>, <audio>, iframes.
+//   'attachment'           — the Download action.
+// The distinction has to be made HERE because the browser cannot make it: an
+// `<a download>` hint is ignored for cross-origin URLs, and the storage
+// location's URL is always cross-origin to the Forge iframe. Without this the
+// Download action navigated instead of saving, and saved under the opaque
+// object key (a UUID, no extension) when it saved at all.
 resolver.define('getDownloadUrl', async (req) => {
-  const { attachmentId } = req.payload as { attachmentId: string };
+  const { attachmentId, disposition } = req.payload as {
+    attachmentId: string;
+    disposition?: 'inline' | 'attachment';
+  };
   const attachment = await attachmentRepository.getAttachmentById(attachmentId);
   if (!attachment) throw new Error(`Attachment "${attachmentId}" was not found`);
-  
+
   await verifyIssueAccess(attachment.issueId);
   try {
     const provider = await getStorageProvider({ projectId: attachment.projectId });
-    const { url } = await provider.download(attachment.objectKey);
+    const { url } = await provider.download(
+      attachment.objectKey,
+      disposition === 'attachment' ? { downloadFilename: attachment.filename } : undefined
+    );
     return { url, filename: attachment.filename, mimeType: attachment.mimeType, size: attachment.size };
   } catch (err) {
     // If the bytes are genuinely missing from the location, return a structured
@@ -109,15 +124,28 @@ resolver.define('getThumbnailUrls', async (req) => {
       console.warn(`[ProjectBucket] Skipping thumbnails for unauthorized/missing issue ${issueId}`);
       continue;
     }
-    for (const attachment of issueAttachments) {
-      try {
+    // Minting each URL costs a HEAD plus a signature, and a full gallery page
+    // asks for up to 100 at once. Doing that sequentially put a single panel
+    // open into multi-second territory against the function timeout, so fan out
+    // at the same width the existence checks already use.
+    const minted = await mapSettledWithConcurrency(
+      issueAttachments,
+      async (attachment) => {
         const provider = await getStorageProvider({ projectId: attachment.projectId });
         const { url } = await provider.download(attachment.thumbnailKey!);
-        urls[attachment.id] = url;
-      } catch (err) {
-        if (err instanceof ObjectNotFoundError) continue;
-        throw err;
+        return { id: attachment.id, url };
+      },
+      10
+    );
+    for (const result of minted) {
+      if (result.status === 'fulfilled') {
+        urls[result.value.id] = result.value.url;
+        continue;
       }
+      // A thumbnail is progressive enhancement: a missing or unreadable one
+      // falls back to the file-type icon. Never fail the whole page over it.
+      if (result.reason instanceof ObjectNotFoundError) continue;
+      console.warn('[ProjectBucket] Could not mint a thumbnail URL:', result.reason);
     }
   }
   return urls;
@@ -403,7 +431,7 @@ resolver.define('recordAttachments', async (req) => {
     issueKey: issueData.key,
     epicKey: issueData.fields.parent ? issueData.fields.parent.key : null,
   };
-  const storageBucket = (provider as any).bucket || (provider as any).bucketName;
+  const storageBucket = provider.containerName;
 
   // Verify EVERY item before persisting ANY of them. This loop used to insert
   // as it went and throw on the first bad item, which committed the rows before
@@ -420,12 +448,23 @@ resolver.define('recordAttachments', async (req) => {
     if (!summary || summary.size !== item.size) {
       throw new Error(`Upload verification failed for "${item.filename}" — object was not found in storage`);
     }
+    // Re-validate the name we are about to PERSIST. uploadObjects validated the
+    // name supplied when the target was minted, but this is a separate call and
+    // nothing binds the two: without this, a client could pass validation as
+    // "report.png", then record the very same object as "payroll.exe".
+    // Persisting the normalized form also keeps what the gallery shows, what a
+    // download is named, and what was actually checked in agreement.
+    const filename = FileNormalizer.normalizeFilename(item.filename);
+    const nameCheck = validateStateless({ filename, size: item.size, mimeType: item.mimeType });
+    if (!nameCheck.passed) {
+      throw new Error(`"${item.filename}" cannot be recorded — ${nameCheck.message}`);
+    }
     const attachment = {
       id: randomUUID(),
       issueId,
       projectId,
-      filename: item.filename,
-      extension: extensionOf(item.filename),
+      filename,
+      extension: extensionOf(filename),
       mimeType: item.mimeType || 'application/octet-stream',
       size: item.size,
       checksum: item.checksum,
@@ -526,33 +565,62 @@ resolver.define('beginMigration', async (req) => {
 });
 
 resolver.define('getMigrationUploadTarget', async (req) => {
-  const { migrationId, itemId, length, checksum, checksumType } = req.payload as {
+  const { migrationId, itemId, length, mimeType, checksum, checksumType } = req.payload as {
     migrationId: string;
     itemId: string;
     length: number;
+    mimeType?: string;
     checksum: string;
     checksumType: ChecksumType;
   };
+  // Minting the target is where the migration path enforces file validation —
+  // see migrationService.getUploadTarget.
+  requireAccountId(req.context);
   const cloudId = req.context.installContext.replace('ari:cloud:jira::site/', '');
-  return migrationService.getUploadTarget({ migrationId, itemId, length, checksum, checksumType, cloudId });
+  return migrationService.getUploadTarget({ migrationId, itemId, length, mimeType, checksum, checksumType, cloudId });
 });
 
 // PHASE 1: record that one item's bytes are verified in storage backend. Does not
 // persist an attachment or touch the native Jira copy — see migrationService.
 resolver.define('stageMigrationItem', async (req) => {
-  const { migrationId, itemId, objectKey, mimeType, size, checksum } = req.payload as {
-    migrationId: string;
-    itemId: string;
-    objectKey: string;
-    mimeType: string;
-    size: number;
-    checksum: string;
-  };
+  const { migrationId, itemId, objectKey, mimeType, size, checksum, thumbnailKey, thumbnailStatus } =
+    req.payload as {
+      migrationId: string;
+      itemId: string;
+      objectKey: string;
+      mimeType: string;
+      size: number;
+      checksum: string;
+      thumbnailKey?: string | null;
+      thumbnailStatus?: AttachmentThumbnailStatus | null;
+    };
   // Require an authenticated user here too: only the eventual committer's
   // identity matters for the persisted attachment, but staging is a
   // user-initiated action and should never run unauthenticated.
   requireAccountId(req.context);
-  return migrationService.stageMigrationItem({ migrationId, itemId, objectKey, mimeType, size, checksum });
+  return migrationService.stageMigrationItem({
+    migrationId,
+    itemId,
+    objectKey,
+    mimeType,
+    size,
+    checksum,
+    thumbnailKey,
+    thumbnailStatus,
+  });
+});
+
+// The client's content validation rejected an item's bytes. Withdraws the item
+// from the session (native Jira copy deliberately kept) instead of failing the
+// whole run — see MigrationItemStatus.BLOCKED.
+resolver.define('blockMigrationItem', async (req) => {
+  const { migrationId, itemId, reason } = req.payload as {
+    migrationId: string;
+    itemId: string;
+    reason: string;
+  };
+  requireAccountId(req.context);
+  return migrationService.blockMigrationItem({ migrationId, itemId, reason });
 });
 
 resolver.define('failMigrationItem', async (req) => {

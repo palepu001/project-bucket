@@ -103,6 +103,10 @@ export type MigrationItemStatus =
   | 'SUCCEEDED'
   | 'SOURCE_DELETE_FAILED'
   | 'SOURCE_MISSING'
+  // Failed validation, so it may not go to the storage location. Withdrawn from
+  // the session rather than failing it — the file stays in Jira, untouched, and
+  // the rest of the session migrates. Permanent: retrying cannot change it.
+  | 'BLOCKED'
   | 'FAILED';
 
 export interface MigrationItem {

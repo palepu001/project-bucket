@@ -19,6 +19,7 @@ import {
   generateProjectBucketName,
   provisionBucket,
 } from '../services/bucketProvisioningService';
+import { clearStorageProviderCache } from '../storage';
 
 
 const resolver = new Resolver();
@@ -65,6 +66,8 @@ resolver.define('setMode', async (req) => {
   await verifyAdminAccess();
   const { mode } = req.payload as { mode: 'INSTANCE' | 'PROJECT' };
   await setStorageMode(mode);
+  // Anything cached under the old mode now points at the wrong location.
+  clearStorageProviderCache();
   return { success: true };
 });
 
@@ -80,6 +83,10 @@ resolver.define('saveCredentials', async (req) => {
     await setInstanceCredentials(creds);
   }
 
+  // A rotated key must take effect now, not whenever the cached provider
+  // happens to expire. (The cache is also TTL-bounded, which is what covers
+  // the other containers this invocation cannot reach.)
+  clearStorageProviderCache();
   return { success: true };
 });
 
@@ -127,6 +134,8 @@ resolver.define('provision', async (req) => {
         status: 'PROVISIONED',
         provisionedAt: new Date().toISOString(),
       });
+      // The bucket this project resolves to just changed.
+      clearStorageProviderCache();
       return { success: true, bucketName };
     } catch (error: any) {
       await setProjectBucketStatus(projectId, { name: bucketName, status: 'ERROR', lastError: error.message });
@@ -141,6 +150,8 @@ resolver.define('provision', async (req) => {
         status: 'PROVISIONED',
         provisionedAt: new Date().toISOString(),
       });
+      // The bucket this instance resolves to just changed.
+      clearStorageProviderCache();
       return { success: true, bucketName };
     } catch (error: any) {
       await setInstanceBucketStatus({ name: bucketName, status: 'ERROR', lastError: error.message });

@@ -3,6 +3,7 @@ import { sql } from '@forge/sql';
 import { ensureSchema } from '../db/client';
 import { nowSqlDateTime, sqlDateTimeToIso } from '../db/time';
 import { MigrationItem, MigrationItemStatus, MigrationRun, MigrationRunStatus } from '../types/migration';
+import { AttachmentThumbnailStatus } from '../types/attachment';
 
 interface MigrationRunRow {
   id: string;
@@ -32,6 +33,8 @@ interface MigrationItemRow {
   mime_type: string | null;
   size_bytes: number | null;
   checksum: string | null;
+  thumbnail_key: string | null;
+  thumbnail_status: AttachmentThumbnailStatus | null;
 }
 
 // The staged state a migration item carries between the STAGE step (bytes
@@ -48,6 +51,10 @@ export interface StagedMigrationItem {
   mimeType: string | null;
   size: number | null;
   checksum: string | null;
+  // Preview rendition the client generated from the Jira bytes and already
+  // uploaded, carried through to the attachment row the commit persists.
+  thumbnailKey: string | null;
+  thumbnailStatus: AttachmentThumbnailStatus | null;
 }
 
 function toMigrationItem(row: MigrationItemRow): MigrationItem {
@@ -158,6 +165,8 @@ export async function updateMigrationItem(
     mimeType?: string | null;
     size?: number | null;
     checksum?: string | null;
+    thumbnailKey?: string | null;
+    thumbnailStatus?: AttachmentThumbnailStatus | null;
     startedAt?: boolean;
     completedAt?: boolean;
   }
@@ -189,6 +198,14 @@ export async function updateMigrationItem(
   if (patch.checksum !== undefined) {
     sets.push('checksum = ?');
     values.push(patch.checksum);
+  }
+  if (patch.thumbnailKey !== undefined) {
+    sets.push('thumbnail_key = ?');
+    values.push(patch.thumbnailKey);
+  }
+  if (patch.thumbnailStatus !== undefined) {
+    sets.push('thumbnail_status = ?');
+    values.push(patch.thumbnailStatus);
   }
   if (patch.startedAt) {
     sets.push('started_at = ?');
@@ -225,6 +242,8 @@ export async function getStagedMigrationItems(migrationId: string): Promise<Stag
     mimeType: row.mime_type,
     size: row.size_bytes === null ? null : Number(row.size_bytes),
     checksum: row.checksum,
+    thumbnailKey: row.thumbnail_key ?? null,
+    thumbnailStatus: row.thumbnail_status ?? null,
   }));
 }
 
@@ -258,7 +277,8 @@ export async function resetItemsForRetry(migrationId: string, itemIds: string[])
     .prepare(
       `UPDATE migration_items
        SET status = 'PENDING', error_message = NULL, started_at = NULL, completed_at = NULL,
-           object_key = NULL, mime_type = NULL, size_bytes = NULL, checksum = NULL
+           object_key = NULL, mime_type = NULL, size_bytes = NULL, checksum = NULL,
+           thumbnail_key = NULL, thumbnail_status = NULL
        WHERE migration_id = ? AND id IN (${placeholders})`
     )
     .bindParams(migrationId, ...itemIds)

@@ -48,6 +48,21 @@ export interface ViewUrl {
   url: string;
 }
 
+export interface DownloadOptions {
+  /**
+   * When set, the returned URL must make the browser SAVE the bytes under this
+   * name rather than render them inline.
+   *
+   * This has to be the location's job, not the caller's. A browser only honours
+   * an `<a download="...">` hint for same-origin URLs, and every location worth
+   * supporting serves bytes from its own origin — so a cross-origin URL without
+   * this option navigates instead of downloading, and saves under whatever the
+   * location derives from the opaque `ref` (for S3: a UUID with no extension).
+   * Leave it unset for preview/thumbnail URLs, which must stay inline.
+   */
+  downloadFilename?: string;
+}
+
 /** Raw byte stream for the file at `ref`, used by the content-proxy preview. */
 export interface ByteStream {
   body: ReadableStream<Uint8Array>;
@@ -78,8 +93,19 @@ export interface AttachmentStorageProvider {
   /** Prepare a byte transfer into `ref`, returning the request a client should issue. */
   upload(request: UploadRequest): Promise<UploadTarget>;
 
-  /** Return a URL a client can load to view/download the file at `ref`. */
-  download(ref: string): Promise<ViewUrl>;
+  /**
+   * Return a URL a client can load to view the file at `ref`, or — when
+   * `options.downloadFilename` is set — to save it under that name.
+   */
+  download(ref: string, options?: DownloadOptions): Promise<ViewUrl>;
+
+  /**
+   * Human-readable name of the container these bytes live in (an S3 bucket
+   * name today), recorded alongside each attachment so an operator can tell
+   * where a file actually is. Purely informational — nothing reads it back to
+   * locate bytes, which is `ref`'s job alone.
+   */
+  readonly containerName: string;
 
   /** Read the raw bytes at `ref`. Returns null if nothing is stored there. */
   stream(ref: string): Promise<ByteStream | null>;

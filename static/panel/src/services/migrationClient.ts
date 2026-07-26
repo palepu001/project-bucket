@@ -3,17 +3,33 @@ import { sha256Base64 } from '../utils/checksum';
 import { runWithConcurrency } from '../utils/concurrency';
 import { MigrationItem, MigrationRun, Session } from '../types';
 import { generateThumbnail, thumbnailFilenameFor } from './thumbnailService';
+import { validateMigratedBlob } from '../security/blobValidation';
 
-// Duplicate of static/panel/src/services/migrationClient.ts — see that
-// file's header comment for why (independently bundled Custom UI resources,
-// small enough that sharing isn't worth cross-package build wiring). Keep
-// the two in sync if this changes.
+// Duplicated as static/attachment-watcher/src/migrationClient.ts, because the
+// panel and the watcher are independently bundled Custom UI resources and
+// wiring a cross-package build to share this file costs more than it saves.
+// Keep the two in sync if this changes.
 
 function callResolver<T>(functionKey: string, payload?: Record<string, unknown>): Promise<T> {
   return invoke(functionKey, payload) as Promise<T>;
 }
 
 const UPLOAD_CONCURRENCY = 3;
+
+// Hashing has to materialize the WHOLE blob as an ArrayBuffer, which doubles
+// that file's memory for the duration. With UPLOAD_CONCURRENCY items in flight
+// and a 256 MB ceiling per file, letting those overlap is how the tab runs out
+// of memory — the same failure SequentialHashEngine was written to fix on the
+// upload path. Serializing just the hash step keeps at most one buffer alive
+// while uploads still overlap.
+let hashChain: Promise<unknown> = Promise.resolve();
+function hashSerially(blob: Blob): Promise<string> {
+  const next = hashChain.then(() => sha256Base64(blob));
+  // Keep the chain alive even if one hash rejects, or every later hash inherits
+  // the rejection and the whole run fails.
+  hashChain = next.catch(() => undefined);
+  return next;
+}
 
 export interface RunMigrationOptions {
   // Retry-only leniency: when true, a definitive 404 downloading an item's
@@ -45,7 +61,26 @@ async function stageOne(run: MigrationRun, item: MigrationItem, skipMissingSourc
     }
     const blob = await contentResponse.blob();
     const mimeType = blob.type || 'application/octet-stream';
-    const checksum = await sha256Base64(blob);
+
+    // Check the bytes BEFORE anything leaves for the storage location. The
+    // backend re-checks what it can when it mints the target, but the
+    // magic-number check needs the bytes, which only this side has.
+    //
+    // A block is reported as BLOCKED, not as a failure: the verdict is
+    // permanent, so failing would abort the whole session every time it was
+    // retried and strand the other files in Jira forever. The blocked file
+    // simply stays in Jira and the rest of the session migrates.
+    const validation = await validateMigratedBlob(blob, item.filename, mimeType);
+    if (!validation.passed) {
+      await callResolver('blockMigrationItem', {
+        migrationId,
+        itemId: item.id,
+        reason: validation.message,
+      });
+      return;
+    }
+
+    const checksum = await hashSerially(blob);
 
     // Generate thumbnail while we have the blob in memory
     let thumbnailPromise: Promise<{ blob: Blob | null; status: string }> = Promise.resolve({ blob: null, status: 'UNSUPPORTED' });
@@ -59,6 +94,7 @@ async function stageOne(run: MigrationRun, item: MigrationItem, skipMissingSourc
       migrationId,
       itemId: item.id,
       length: blob.size,
+      mimeType,
       checksum,
       checksumType: 'SHA256',
     });
@@ -79,7 +115,7 @@ async function stageOne(run: MigrationRun, item: MigrationItem, skipMissingSourc
 
     if (thumbnailResult.blob) {
       const thumbBlob = thumbnailResult.blob;
-      const thumbChecksum = await sha256Base64(thumbBlob);
+      const thumbChecksum = await hashSerially(thumbBlob);
       const [thumbTarget] = await callResolver<any[]>('uploadObjects', {
         objects: [{
           filename: thumbnailFilenameFor(item.filename),

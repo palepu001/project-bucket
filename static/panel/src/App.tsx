@@ -70,7 +70,10 @@ export function App()  {
 
   async function handleDownload(attachment: Attachment) {
     try {
-      const result = await api.getDownloadUrl(attachment.id);
+      // 'attachment' makes the storage location return a Content-Disposition
+      // that saves the file under its real name — the `<a download>` hint alone
+      // does nothing for a cross-origin URL.
+      const result = await api.getDownloadUrl(attachment.id, 'attachment');
       // If the object is missing from storage, show a friendly message
       // instead of attempting a download that will fail.
       if (result.unavailable || !result.url) {

@@ -8,7 +8,13 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint src/**/*.ts || npm run --silent hook-errors",
     "hook-errors": "echo '\\x1b[31mThe build failed lint checks. See the eslint output above for details.\\n' && exit 1",
-    "test": "node --import tsx --test \"src/**/*.test.ts\""
+    "test": "node --import tsx --test \"src/**/*.test.ts\"",
+    "test:panel": "npm --prefix static/panel test",
+    "test:watcher": "node --import tsx --test \"static/attachment-watcher/src/**/*.test.ts\"",
+    "test:all": "npm test && npm run test:panel && npm run test:watcher",
+    "typecheck:all": "npm run typecheck && npm --prefix static/panel run typecheck && npm --prefix static/attachment-watcher run typecheck",
+    "build:ui": "npm --prefix static/panel run build && npm --prefix static/attachment-watcher run build",
+    "verify": "npm run typecheck:all && npm run lint && npm run test:all && npm run build:ui"
   },
   "devDependencies": {
     "@types/node": "^20.11.30",

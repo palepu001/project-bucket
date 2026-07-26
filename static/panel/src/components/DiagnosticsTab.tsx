@@ -25,6 +25,9 @@ function itemGlyph(status: string): string {
   if (status === 'FAILED') return '✗';
   if (status === 'SOURCE_DELETE_FAILED') return '⚠';
   if (status === 'SOURCE_MISSING') return '–';
+  // Blocked is not a failure of the run — the file was simply not eligible and
+  // stayed in Jira — so it gets its own mark rather than a cross.
+  if (status === 'BLOCKED') return '⊘';
   return '…';
 }
 
@@ -213,7 +216,8 @@ export function DiagnosticsTab({ issueId }: { issueId: string })  {
                 {item.errorMessage &&
                   (item.status === 'FAILED' ||
                     item.status === 'SOURCE_DELETE_FAILED' ||
-                    item.status === 'SOURCE_MISSING') && (
+                    item.status === 'SOURCE_MISSING' ||
+                    item.status === 'BLOCKED') && (
                   <span className="pb-state-detail"> — {item.errorMessage}</span>
                 )}
               </li>

@@ -8,9 +8,11 @@ import * as graphSyncService from './graphSyncService';
 import { resolveMediaId, removeMediaReferences } from './jiraContentCleanup';
 import { getStorageProvider, ChecksumType } from '../storage';
 import { generateStorageKey, StorageKeyContext } from '../util/storageKey';
+import { FileNormalizer } from '../shared/security/normalizer';
+import { validateStateless } from '../shared/security/validators/statelessPipeline';
 import api, { route } from '@forge/api';
-import { extensionOf } from '../types/attachment';
-import { MigrationRun } from '../types/migration';
+import { AttachmentThumbnailStatus, extensionOf } from '../types/attachment';
+import { MigrationItemStatus, MigrationRun } from '../types/migration';
 
 // Orchestrates the Jira-native → Project Bucket migration of ONE upload
 // session as a single transaction. The unit of work is the whole session, not
@@ -67,12 +69,33 @@ export async function getUploadTarget(params: {
   migrationId: string;
   itemId: string;
   length: number;
+  mimeType?: string;
   checksum: string;
   checksumType: ChecksumType;
   cloudId: string;
 }): Promise<{ objectKey: string; uploadUrl: string; method?: string; headers?: Record<string, string> }> {
   const run = await migrationRepository.getMigrationRun(params.migrationId);
   if (!run) throw new Error('Migration run not found');
+
+  // Same trust boundary the "Add Attachment" path enforces in the uploadObjects
+  // resolver. Minting a transfer target IS the moment bytes are allowed to
+  // reach the storage location, so it must be gated here and not only in the
+  // browser — a client that skips its own checks must still be stopped, and
+  // migrated Jira content is the LEAST trusted input the app handles.
+  const item = run.items.find((candidate) => candidate.id === params.itemId);
+  if (!item) throw new Error(`Migration item "${params.itemId}" not found in run "${params.migrationId}"`);
+
+  const normalizedName = FileNormalizer.normalizeFilename(item.filename);
+  const validation = validateStateless({
+    filename: normalizedName,
+    size: params.length,
+    mimeType: params.mimeType ?? 'application/octet-stream',
+  });
+  if (!validation.passed) {
+    await blockItem(params.itemId, item.filename, validation.message ?? 'File type is not allowed.');
+    throw new Error(`"${item.filename}" cannot be migrated — ${validation.message}`);
+  }
+
   await migrationRepository.updateMigrationItem(params.itemId, { status: 'UPLOADING', startedAt: true });
 
   const issueResponse = await api.asApp().requestJira(route`/rest/api/3/issue/${run.issueId}?fields=project,parent`);
@@ -114,6 +137,8 @@ export async function stageMigrationItem(params: {
   mimeType: string;
   size: number;
   checksum: string;
+  thumbnailKey?: string | null;
+  thumbnailStatus?: AttachmentThumbnailStatus | null;
 }): Promise<{ staged: true }> {
   const run = await migrationRepository.getMigrationRun(params.migrationId);
   if (!run) throw new Error('Migration run not found');
@@ -142,15 +167,80 @@ export async function stageMigrationItem(params: {
     mimeType: params.mimeType,
     size: params.size,
     checksum: params.checksum,
+    thumbnailKey: params.thumbnailKey ?? null,
+    thumbnailStatus: params.thumbnailStatus ?? null,
   });
   return { staged: true };
 }
 
+/**
+ * Marks one item permanently un-migratable and withdraws it from the session's
+ * transaction. Its native Jira copy is left exactly where it is, so "blocked"
+ * costs the user nothing beyond the file staying in Jira. Shared by the backend
+ * gate in getUploadTarget and the client-reported content check below.
+ */
+async function blockItem(itemId: string, filename: string, reason: string): Promise<void> {
+  await migrationRepository.updateMigrationItem(itemId, {
+    status: 'BLOCKED',
+    errorMessage:
+      `"${filename}" was not moved to Project Bucket — ${reason} ` +
+      'It has been left in Jira, and the other files in this session were migrated normally.',
+    completedAt: true,
+  });
+}
+
+/**
+ * The client validated the downloaded bytes and rejected them. Only the client
+ * can run the magic-number check (it is the only side that holds the bytes), so
+ * unlike skipMissingMigrationItem there is nothing to re-verify server-side —
+ * and nothing to gain by doing so: the outcome is strictly conservative. A
+ * blocked item is withdrawn from the session and its native Jira copy is kept,
+ * so a client that lies here only denies itself a migration.
+ */
+export async function blockMigrationItem(params: {
+  migrationId: string;
+  itemId: string;
+  reason: string;
+}): Promise<{ blocked: true }> {
+  const items = await migrationRepository.getStagedMigrationItems(params.migrationId);
+  const item = items.find((candidate) => candidate.id === params.itemId);
+  if (!item) throw new Error(`Migration item "${params.itemId}" not found`);
+
+  // Terminal-state guard: never rewrite an item that already persisted.
+  if (item.status === 'SUCCEEDED' || item.status === 'SOURCE_DELETE_FAILED') {
+    return { blocked: true };
+  }
+  await blockItem(params.itemId, item.filename, params.reason);
+  return { blocked: true };
+}
+
+/**
+ * Records a per-item staging failure, which aborts the whole session at commit.
+ *
+ * Refuses to overwrite an item that has already reached a terminal state. This
+ * matters most for BLOCKED: when the BACKEND gate rejects a file, it also
+ * throws, and the client's catch-all reports that throw straight back here — so
+ * without this guard the client would immediately downgrade "this file is not
+ * allowed, the others migrated fine" into "the session failed", which is
+ * exactly the permanently-stuck session BLOCKED exists to prevent.
+ */
 export async function failMigrationItem(params: {
   migrationId: string;
   itemId: string;
   error: string;
 }): Promise<void> {
+  const items = await migrationRepository.getStagedMigrationItems(params.migrationId);
+  const item = items.find((candidate) => candidate.id === params.itemId);
+  if (
+    item &&
+    (item.status === 'BLOCKED' ||
+      item.status === 'SOURCE_MISSING' ||
+      item.status === 'SUCCEEDED' ||
+      item.status === 'SOURCE_DELETE_FAILED')
+  ) {
+    return;
+  }
+
   await migrationRepository.updateMigrationItem(params.itemId, {
     status: 'FAILED',
     errorMessage: params.error,
@@ -203,18 +293,62 @@ export async function skipMissingMigrationItem(params: {
   return { skipped: true };
 }
 
+export type CommitAction = 'nothing-to-do' | 'persist' | 'retry-deletes' | 'abort';
+
+export interface CommitPlan<T extends { status: MigrationItemStatus }> {
+  action: CommitAction;
+  /** The items still inside the transaction — withdrawn ones removed. */
+  present: T[];
+  blockedCount: number;
+}
+
+/**
+ * Decides what a commit should DO, with no I/O. Pure so the transaction rule —
+ * the part where getting it wrong deletes someone's only copy of a file — is
+ * directly testable; see migrationService.test.ts.
+ *
+ * Two statuses are withdrawn from the transaction rather than aborting it:
+ *   SOURCE_MISSING — the native source was deleted before staging, so there is
+ *     nothing left to migrate and nothing left to protect.
+ *   BLOCKED        — the file failed validation and may not go to the storage
+ *     location. That verdict is permanent, so aborting would strand the entire
+ *     session forever; the native Jira copy is kept instead.
+ *
+ * Everything else obeys all-or-nothing:
+ *   'persist'       — every remaining item is STAGED: persist all metadata,
+ *                     then delete all native copies.
+ *   'retry-deletes' — every remaining item is already persisted (a retry of a
+ *                     PARTIAL_FAILURE run): only re-attempt the deletions.
+ *   'abort'         — anything else, including a single item that failed to
+ *                     stage: persist nothing, delete nothing, mark FAILED.
+ *   'nothing-to-do' — every item was withdrawn. Nothing to migrate, nothing
+ *                     lost.
+ */
+export function planCommit<T extends { status: MigrationItemStatus }>(items: T[]): CommitPlan<T> {
+  const isWithdrawn = (status: MigrationItemStatus) =>
+    status === 'SOURCE_MISSING' || status === 'BLOCKED';
+
+  const present = items.filter((item) => !isWithdrawn(item.status));
+  const blockedCount = items.filter((item) => item.status === 'BLOCKED').length;
+
+  const allStaged = present.length > 0 && present.every((item) => item.status === 'STAGED');
+  const allPersisted =
+    present.length > 0 &&
+    present.every((item) => item.status === 'SUCCEEDED' || item.status === 'SOURCE_DELETE_FAILED');
+
+  let action: CommitAction;
+  if (items.length > 0 && present.length === 0) action = 'nothing-to-do';
+  else if (allStaged) action = 'persist';
+  else if (allPersisted) action = 'retry-deletes';
+  else action = 'abort';
+
+  return { action, present, blockedCount };
+}
+
 /**
  * PHASE 2 — the transaction boundary for the whole upload session. Called once,
- * after the client has attempted to stage every item.
- *
- *   • If any item is not STAGED (i.e. one failed to stage), ABORT: persist
- *     nothing, delete nothing from Jira, mark the run FAILED. Every native
- *     attachment stays in Jira and the session can be retried from the start.
- *   • If every item is STAGED (a fresh commit), persist metadata for ALL items
- *     first, then delete ALL native copies. A native-delete failure leaves the
- *     file safe in Project Bucket, so it is a PARTIAL_FAILURE, not a lost file.
- *   • If every item is already persisted (a retry of a PARTIAL_FAILURE run),
- *     just re-attempt the outstanding native deletions.
+ * after the client has attempted to stage every item. See planCommit above for
+ * the decision itself; this function only carries it out.
  */
 export async function commitMigrationRun(params: {
   migrationId: string;
@@ -224,23 +358,16 @@ export async function commitMigrationRun(params: {
   if (!run) throw new Error(`Migration run "${params.migrationId}" not found`);
 
   const items = await migrationRepository.getStagedMigrationItems(params.migrationId);
-  // SOURCE_MISSING items are withdrawn from the transaction — their native
-  // source was deleted before staging, so there is nothing to migrate and
-  // nothing to protect. The all-or-nothing rule applies to the items whose
-  // sources still exist.
-  const present = items.filter((item) => item.status !== 'SOURCE_MISSING');
-  const allStaged = present.length > 0 && present.every((item) => item.status === 'STAGED');
-  const allPersisted =
-    present.length > 0 &&
-    present.every((item) => item.status === 'SUCCEEDED' || item.status === 'SOURCE_DELETE_FAILED');
+  const { action, present, blockedCount } = planCommit(items);
 
-  if (items.length > 0 && present.length === 0) {
-    // Every source in the session vanished before migration. Nothing to do,
-    // nothing lost — the session is trivially complete with zero migrations.
-    await migrationRepository.setRunFinal(params.migrationId, 'COMPLETED', 0, 0);
-  } else if (allStaged) {
-    await persistAndDeleteSession(run, present, params.actorAccountId);
-  } else if (allPersisted) {
+  if (action === 'nothing-to-do') {
+    // Every item was withdrawn — sources vanished, files were blocked, or both.
+    // Nothing to do and nothing lost: blocked files are still in Jira. The run
+    // is complete with zero migrations, and failedCount surfaces the blocks.
+    await migrationRepository.setRunFinal(params.migrationId, 'COMPLETED', 0, blockedCount);
+  } else if (action === 'persist') {
+    await persistAndDeleteSession(run, present, params.actorAccountId, blockedCount);
+  } else if (action === 'retry-deletes') {
     // Retry of a PARTIAL_FAILURE run: metadata already exists, only the native
     // deletions need re-attempting. Re-run deletion for the lingering copies.
     const lingering = items.filter((item) => item.status === 'SOURCE_DELETE_FAILED');
@@ -248,7 +375,7 @@ export async function commitMigrationRun(params: {
       run.issueId,
       lingering.map((item) => ({ item, attachmentId: item.attachmentId! }))
     );
-    await finalizeAfterCommit(run);
+    await finalizeAfterCommit(run, blockedCount);
   } else {
     // At least one item failed to stage (or is still pending). Honour the
     // transaction rule: keep every native attachment, persist nothing.
@@ -274,7 +401,8 @@ export async function commitMigrationRun(params: {
 async function persistAndDeleteSession(
   run: MigrationRun,
   items: StagedItem[],
-  actorAccountId: string
+  actorAccountId: string,
+  blockedCount: number
 ): Promise<void> {
   // Durability gate: each object was verified when it was staged, but the whole
   // point of the two-phase commit is that the irreversible half (deleting native
@@ -328,7 +456,7 @@ async function persistAndDeleteSession(
   }
 
   await deleteNativeCopiesAndCleanReferences(run.issueId, persisted);
-  await finalizeAfterCommit(run);
+  await finalizeAfterCommit(run, blockedCount);
 }
 
 async function persistAttachment(run: MigrationRun, item: StagedItem, actorAccountId: string, hierarchy: { projectKey: string, issueKey: string, epicKey: string | null }): Promise<string> {
@@ -337,6 +465,7 @@ async function persistAttachment(run: MigrationRun, item: StagedItem, actorAccou
   }
   const attachmentId = randomUUID();
   const now = new Date().toISOString();
+  const provider = await getStorageProvider({ projectId: run.projectId });
   await attachmentRepository.insertAttachment({
     id: attachmentId,
     issueId: run.issueId,
@@ -354,10 +483,15 @@ async function persistAttachment(run: MigrationRun, item: StagedItem, actorAccou
     syncStatus: 'READY',
     source: 'JIRA_MIGRATION',
     jiraAttachmentId: item.jiraAttachmentId,
+    // The rendition the client generated from the Jira bytes and already
+    // uploaded. Recording it is what stops the gallery re-rendering the same
+    // image through the backfill path and stops the uploaded object leaking.
+    thumbnailKey: item.thumbnailKey,
+    thumbnailStatus: item.thumbnailStatus,
     projectKey: hierarchy.projectKey,
     issueKey: hierarchy.issueKey,
     epicKey: hierarchy.epicKey,
-    storageBucket: (await getStorageProvider({ projectId: run.projectId }) as any).bucketName,
+    storageBucket: provider.containerName,
   });
   // Metadata now points at this migration item's persisted attachment, so the
   // diagnostics UI and any retry can correlate the two.
@@ -428,13 +562,22 @@ async function deleteNativeCopies(targets: { item: StagedItem; attachmentId: str
 // Computes the run's terminal state from its items after a commit/deletion
 // pass. Every item is in Project Bucket at this point; the only question is
 // whether any native copy is still lingering.
-async function finalizeAfterCommit(run: MigrationRun): Promise<void> {
+async function finalizeAfterCommit(run: MigrationRun, blockedCount = 0): Promise<void> {
   const items = await migrationRepository.getStagedMigrationItems(run.id);
   const migrated = items.filter(
     (item) => item.status === 'SUCCEEDED' || item.status === 'SOURCE_DELETE_FAILED'
   ).length;
   const anyLingering = items.some((item) => item.status === 'SOURCE_DELETE_FAILED');
-  await migrationRepository.setRunFinal(run.id, anyLingering ? 'PARTIAL_FAILURE' : 'COMPLETED', migrated, 0);
+  // Blocked files count as "not migrated" so the run's own numbers admit that
+  // something stayed in Jira, but they do NOT make the run retryable: the
+  // migratable half really did finish, and re-running would reach the same
+  // verdict on the same bytes.
+  await migrationRepository.setRunFinal(
+    run.id,
+    anyLingering ? 'PARTIAL_FAILURE' : 'COMPLETED',
+    migrated,
+    blockedCount
+  );
 }
 
 /**
@@ -454,10 +597,14 @@ export async function prepareRetry(migrationId: string): Promise<MigrationRun> {
     // Re-stage everything that is not already successfully staged. Besides the
     // FAILED items this also recovers any left UPLOADING/PENDING by a browser
     // that died mid-stage — otherwise those would never be re-attempted and the
-    // commit could never see the whole session as staged. SOURCE_MISSING items
-    // stay withdrawn: their native source is gone and can never stage again.
+    // commit could never see the whole session as staged. SOURCE_MISSING and
+    // BLOCKED items stay withdrawn: the first has no source left to stage, and
+    // the second would fail the identical checks on the identical bytes.
     const retryItemIds = run.items
-      .filter((item) => item.status !== 'STAGED' && item.status !== 'SOURCE_MISSING')
+      .filter(
+        (item) =>
+          item.status !== 'STAGED' && item.status !== 'SOURCE_MISSING' && item.status !== 'BLOCKED'
+      )
       .map((item) => item.id);
     await migrationRepository.resetItemsForRetry(migrationId, retryItemIds);
     await migrationRepository.reopenRun(migrationId);

@@ -48,11 +48,22 @@ export type MigrationRunStatus = 'RUNNING' | 'COMPLETED' | 'PARTIAL_FAILURE' | '
 // a staged item can still be abandoned with zero side effects if a sibling
 // item in the same session fails to stage.
 //
-// SOURCE_MISSING is the one exit that does NOT abort the session: Jira
+// SOURCE_MISSING is one of two exits that do NOT abort the session: Jira
 // definitively reported the native attachment gone (404, re-verified by the
 // backend) — i.e. someone deleted it between detection and "Link All". There
 // is nothing left to migrate and nothing to protect, so the item is treated
 // as withdrawn from the session and the remaining items commit without it.
+//
+// BLOCKED is the other. The file failed validation (disallowed extension,
+// denied MIME type, or content that does not match its claimed extension), so
+// it may not go to the storage location at all. That verdict is PERMANENT —
+// a retry re-runs the same checks over the same bytes and reaches the same
+// answer — so aborting the session over it would hand the user a popup they
+// can never clear and strand every other file in the session in Jira forever.
+// The item is withdrawn instead: its native Jira copy is deliberately left in
+// place (untouched — nothing is lost, the file simply stays in Jira), the rest
+// of the session commits, and diagnostics explains what stayed behind and why.
+//
 // Anything less definitive (network errors, 5xx, upload/verify failures)
 // still becomes FAILED and aborts the whole session.
 export type MigrationItemStatus =
@@ -62,6 +73,7 @@ export type MigrationItemStatus =
   | 'SUCCEEDED'
   | 'SOURCE_DELETE_FAILED'
   | 'SOURCE_MISSING'
+  | 'BLOCKED'
   | 'FAILED';
 
 export interface MigrationItem {
