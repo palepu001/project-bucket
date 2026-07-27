@@ -61,6 +61,13 @@ export class S3StorageProvider implements AttachmentStorageProvider {
       ChecksumSHA256: request.checksum,
     });
 
+    // getSignedUrl hoists every x-amz-* header (including the checksum one
+    // ChecksumSHA256 above maps to) into the presigned URL's query string by
+    // default, so the checksum is already part of the signature. Telling the
+    // client to *also* send it as a literal header makes S3 reject the
+    // upload: that header is present on the request but absent from
+    // SignedHeaders, which S3 reports as "There were headers present in the
+    // request which were not signed."
     const url = await getSignedUrl(this.s3, command, {
       expiresIn: 3600,
     });
@@ -68,9 +75,6 @@ export class S3StorageProvider implements AttachmentStorageProvider {
     return {
       url,
       method: 'PUT',
-      headers: {
-        'x-amz-checksum-sha256': request.checksum,
-      },
     };
   }
 
