@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { view } from '@forge/bridge';
+import { view, invoke } from '@forge/bridge';
 
 export interface IssueContext {
   issueId: string;
@@ -10,8 +10,9 @@ export interface IssueContext {
 interface JiraIssuePanelContext {
   accountId?: string;
   extension: {
-    issue: { id: string; key: string };
-    project: { id: string; key: string };
+    issue?: { id: string; key: string };
+    request?: { id: string; key: string; issueId?: string };
+    project?: { id: string; key: string };
   };
 }
 
@@ -23,16 +24,32 @@ export function useIssueContext(): { context: IssueContext | null; error: string
     let cancelled = false;
     view
       .getContext()
-      .then((raw) => {
+      .then(async (raw) => {
         if (cancelled) return;
         const ctx = raw as unknown as JiraIssuePanelContext;
-        if (!ctx.accountId || !ctx.extension?.issue?.id || !ctx.extension?.project?.id) {
+        
+        const issueId = ctx.extension?.issue?.id || ctx.extension?.request?.issueId || ctx.extension?.request?.id;
+        let projectId = ctx.extension?.project?.id;
+        
+        if (!ctx.accountId || !issueId) {
           setError('Could not resolve the current issue context.');
           return;
         }
+
+        if (!projectId) {
+          try {
+            projectId = (await invoke('getProjectId', { issueId })) as string;
+          } catch (err) {
+            if (!cancelled) setError('Failed to resolve project context for this issue.');
+            return;
+          }
+        }
+
+        if (cancelled) return;
+
         setContext({
-          issueId: ctx.extension.issue.id,
-          projectId: ctx.extension.project.id,
+          issueId: issueId,
+          projectId: projectId!,
           accountId: ctx.accountId,
         });
       })

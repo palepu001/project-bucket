@@ -657,4 +657,17 @@ resolver.define('getMigrationDiagnostics', async (req) => {
   return migrationService.listMigrationRunsForIssue(issueId);
 });
 
+resolver.define('getProjectId', async (req) => {
+  const { issueId } = req.payload as { issueId: string };
+  if (!issueId) throw new Error('getProjectId requires an issueId');
+  
+  // Use asApp() so this works for unlicensed JSM customers who cannot call the API themselves.
+  const response = await api.asApp().requestJira(route`/rest/api/3/issue/${issueId}?fields=project`);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch project for issue ${issueId}`);
+  }
+  const data = await response.json();
+  return data.fields?.project?.id;
+});
+
 export const handler = resolver.getDefinitions();

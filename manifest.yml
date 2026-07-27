@@ -36,6 +36,15 @@ modules:
       title: Project Bucket
       icon: https://developer.atlassian.com/platform/forge/images/icons/issue-panel-icon.svg
 
+  jiraServiceManagement:portalRequestDetailPanel:
+    - key: project-bucket-jsm-portal-panel
+      resource: panel
+      resolver:
+        function: backend-resolver
+      title: Project Bucket
+      unlicensedAccess:
+        - customer
+
   # Invisible watcher loaded on every issue view (independent of whether the
   # panel is expanded). It polls for a "quiet" bulk-attachment session on this
   # issue and, when one is found, shows exactly one grouped popup asking to
