@@ -204,8 +204,16 @@ async function reconcileAddedColumns(
     .execute();
   if ((checkpoint.rows as unknown[]).length > 0) return;
 
-  const existingColumns = await sql.executeDDL(`SHOW COLUMNS FROM ${table}`);
-  const existingNames = new Set((existingColumns.rows as { Field: string }[]).map((row) => row.Field));
+  // Use sql.prepare().execute() rather than sql.executeDDL() here because
+  // executeDDL() is designed for DDL statements (CREATE / ALTER / DROP) and
+  // may not return row data for SHOW queries in all Forge SQL runtime versions.
+  // The explicit prepare/execute path reliably gives us the column list rows.
+  const existingColumnsResult = await sql
+    .prepare(`SHOW COLUMNS FROM ${table}`)
+    .execute();
+  const existingNames = new Set(
+    (existingColumnsResult.rows as { Field: string }[]).map((row) => row.Field)
+  );
 
   for (const column of columns) {
     if (existingNames.has(column.name)) continue;
@@ -214,8 +222,21 @@ async function reconcileAddedColumns(
     } catch (error) {
       // Another concurrent invocation may have added it between our SHOW
       // COLUMNS read and this ALTER — that race is harmless, not a wedge.
-      const message = error instanceof Error ? error.message : String(error);
-      if (!message.includes('Duplicate column')) throw error;
+      //
+      // IMPORTANT: Forge SQL wraps MySQL errors via ForgeSQLAPIError. The
+      // top-level `error.message` is always the generic "Unknown SQL execution
+      // error" string. The actual MySQL message ("Duplicate column name ...") is
+      // nested inside `error.context?.debug?.message`. We must check both so
+      // that this guard works through the Forge SQL wrapper, not just in unit
+      // tests that throw plain Errors.
+      const topMessage = error instanceof Error ? error.message : String(error);
+      const debugMessage: string =
+        (error as any)?.context?.debug?.message ||
+        (error as any)?.context?.debug?.sqlMessage ||
+        '';
+      const isDuplicateColumn =
+        topMessage.includes('Duplicate column') || debugMessage.includes('Duplicate column');
+      if (!isDuplicateColumn) throw error;
     }
   }
 
