@@ -657,17 +657,20 @@ resolver.define('getMigrationDiagnostics', async (req) => {
   return migrationService.listMigrationRunsForIssue(issueId);
 });
 
-resolver.define('getProjectId', async (req) => {
-  const { issueId } = req.payload as { issueId: string };
-  if (!issueId) throw new Error('getProjectId requires an issueId');
-  
+resolver.define('resolveIssueContext', async (req) => {
+  const { issueIdOrKey } = req.payload as { issueIdOrKey: string };
+  if (!issueIdOrKey) throw new Error('resolveIssueContext requires issueIdOrKey');
+
   // Use asApp() so this works for unlicensed JSM customers who cannot call the API themselves.
-  const response = await api.asApp().requestJira(route`/rest/api/3/issue/${issueId}?fields=project`);
+  // JSM's portalRequestDetailPanel context only exposes the issue key (e.g. "SUP-1"), not the
+  // numeric id, so resolve it here to the same numeric id the agent-side issue panel uses —
+  // otherwise attachments recorded from the two surfaces would key on different issueId formats.
+  const response = await api.asApp().requestJira(route`/rest/api/3/issue/${issueIdOrKey}?fields=project`);
   if (!response.ok) {
-    throw new Error(`Failed to fetch project for issue ${issueId}`);
+    throw new Error(`Failed to fetch issue ${issueIdOrKey}`);
   }
   const data = await response.json();
-  return data.fields?.project?.id;
+  return { issueId: data.id as string, projectId: data.fields?.project?.id as string };
 });
 
 export const handler = resolver.getDefinitions();

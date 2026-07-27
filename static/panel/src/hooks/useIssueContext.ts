@@ -11,7 +11,7 @@ interface JiraIssuePanelContext {
   accountId?: string;
   extension: {
     issue?: { id: string; key: string };
-    request?: { id: string; key: string; issueId?: string };
+    request?: { key: string };
     project?: { id: string; key: string };
   };
 }
@@ -27,31 +27,33 @@ export function useIssueContext(): { context: IssueContext | null; error: string
       .then(async (raw) => {
         if (cancelled) return;
         const ctx = raw as unknown as JiraIssuePanelContext;
-        
-        const issueId = ctx.extension?.issue?.id || ctx.extension?.request?.issueId || ctx.extension?.request?.id;
-        let projectId = ctx.extension?.project?.id;
-        
-        if (!ctx.accountId || !issueId) {
+
+        const issueId = ctx.extension?.issue?.id;
+        const projectId = ctx.extension?.project?.id;
+        // JSM's portalRequestDetailPanel only exposes the issue key (e.g. "SUP-1"), not the
+        // numeric issue id or project id — those need a backend lookup.
+        const issueIdOrKey = issueId || ctx.extension?.request?.key;
+
+        if (!ctx.accountId || !issueIdOrKey) {
           setError('Could not resolve the current issue context.');
           return;
         }
 
-        if (!projectId) {
-          try {
-            projectId = (await invoke('getProjectId', { issueId })) as string;
-          } catch (err) {
-            if (!cancelled) setError('Failed to resolve project context for this issue.');
-            return;
-          }
+        if (issueId && projectId) {
+          setContext({ issueId, projectId, accountId: ctx.accountId });
+          return;
         }
 
-        if (cancelled) return;
-
-        setContext({
-          issueId: issueId,
-          projectId: projectId!,
-          accountId: ctx.accountId,
-        });
+        try {
+          const resolved = (await invoke('resolveIssueContext', { issueIdOrKey })) as {
+            issueId: string;
+            projectId: string;
+          };
+          if (cancelled) return;
+          setContext({ issueId: resolved.issueId, projectId: resolved.projectId, accountId: ctx.accountId });
+        } catch (err) {
+          if (!cancelled) setError('Failed to resolve project context for this issue.');
+        }
       })
       .catch((err) => {
         if (!cancelled) setError(err instanceof Error ? err.message : String(err));
