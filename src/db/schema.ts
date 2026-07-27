@@ -1,4 +1,4 @@
-import { migrationRunner, sql } from '@forge/sql';
+import { migrationRunner, sql, ForgeSQLAPIError } from '@forge/sql';
 
 // Every statement is CREATE TABLE IF NOT EXISTS, so re-running this set (the
 // hourly scheduledTrigger safety net, or a race at cold start) is always a
@@ -214,7 +214,15 @@ async function reconcileAddedColumns(
     } catch (error) {
       // Another concurrent invocation may have added it between our SHOW
       // COLUMNS read and this ALTER — that race is harmless, not a wedge.
-      const message = error instanceof Error ? error.message : String(error);
+      // ForgeSQLAPIError.message is a generic "Unknown SQL execution error";
+      // the actual MySQL error text (e.g. "Duplicate column name") is nested
+      // under context.debug.message instead.
+      const message =
+        error instanceof ForgeSQLAPIError
+          ? String((error.context as { debug?: { message?: string } } | undefined)?.debug?.message ?? error.message)
+          : error instanceof Error
+            ? error.message
+            : String(error);
       if (!message.includes('Duplicate column')) throw error;
     }
   }
