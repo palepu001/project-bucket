@@ -124,7 +124,7 @@ export function DiagnosticsTab({ issueId }: { issueId: string })  {
               <thead>
                 <tr>
                   <th>File</th>
-                  <th>Forge object key</th>
+                  <th>Attachment location</th>
                   <th>Storage status</th>
                   <th>Size</th>
                   <th>Checksum</th>
