@@ -63,6 +63,7 @@ export class S3StorageProvider implements AttachmentStorageProvider {
 
     const url = await getSignedUrl(this.s3, command, {
       expiresIn: 3600,
+      unhoistableHeaders: new Set(['x-amz-checksum-sha256']),
     });
 
     return {
