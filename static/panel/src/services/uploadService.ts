@@ -126,7 +126,10 @@ export async function uploadFiles(files: File[], issueId: string, projectId: str
     key: string;
     checksum: string;
     thumbnailKey: string | null;
-    thumbnailStatus: AttachmentThumbnailStatus;
+    // Null for the categories that can only be rendered once their bytes are at
+    // the storage location (video, SVG). It persists as "not attempted", which
+    // is exactly what makes the gallery's backfill finish the job on first view.
+    thumbnailStatus: AttachmentThumbnailStatus | null;
   }[] = [];
 
   for (let i = 0; i < validFiles.length; i++) {

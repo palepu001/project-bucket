@@ -2,7 +2,7 @@ import { requestJira, invoke } from '@forge/bridge';
 import { sha256Base64 } from '../utils/checksum';
 import { runWithConcurrency } from '../utils/concurrency';
 import { MigrationItem, MigrationRun, Session } from '../types';
-import { generateThumbnail, thumbnailFilenameFor } from './thumbnailService';
+import { generateThumbnail, thumbnailFilenameFor, ThumbnailResult } from './thumbnailService';
 import { validateMigratedBlob } from '../security/blobValidation';
 
 // Duplicated as static/attachment-watcher/src/migrationClient.ts, because the
@@ -82,8 +82,11 @@ async function stageOne(run: MigrationRun, item: MigrationItem, skipMissingSourc
 
     const checksum = await hashSerially(blob);
 
-    // Generate thumbnail while we have the blob in memory
-    let thumbnailPromise: Promise<{ blob: Blob | null; status: string }> = Promise.resolve({ blob: null, status: 'UNSUPPORTED' });
+    // Generate thumbnail while we have the blob in memory. A null status means
+    // "not attempted yet" — that is what the video/SVG categories return here,
+    // because they can only be rendered from a URL at the storage location (see
+    // thumbnailService), and it is what makes the gallery backfill finish them.
+    let thumbnailPromise: Promise<ThumbnailResult> = Promise.resolve({ blob: null, status: null });
     try {
       thumbnailPromise = generateThumbnail(blob, item.filename, mimeType);
     } catch (e) {
@@ -109,8 +112,8 @@ async function stageOne(run: MigrationRun, item: MigrationItem, skipMissingSourc
     }
 
     let thumbnailKey: string | null = null;
-    let thumbnailStatus: string | null = null;
-    const thumbnailResult = await thumbnailPromise.catch(() => ({ blob: null, status: 'FAILED' }));
+    let thumbnailStatus: ThumbnailResult['status'] = null;
+    const thumbnailResult = await thumbnailPromise.catch((): ThumbnailResult => ({ blob: null, status: 'FAILED' }));
     thumbnailStatus = thumbnailResult.status;
 
     if (thumbnailResult.blob) {

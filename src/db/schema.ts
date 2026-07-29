@@ -187,6 +187,44 @@ const MIGRATION_ITEM_THUMBNAIL_COLUMNS: { name: string; addColumnDdl: string }[]
 ];
 const V014_MIGRATION_NAME = 'v014_add_migration_items_thumbnail';
 
+// One-time repair. Office documents carry a preview image inside the container
+// that only the authoring application refreshes, so files produced by a script
+// or an export tool ship their template's BLANK placeholder. An earlier build
+// of the thumbnail pipeline trusted that image, which stored blank renditions
+// for those files; the renderer now rejects a blank image and falls back to the
+// document's own text (see thumbnailService.looksBlank), but rows already
+// marked READY would never be reconsidered.
+//
+// Clearing the STATUS alone — not the key — is deliberate: the gallery's
+// backfill re-renders anything without a status, and keeping the old key means
+// recordThumbnail can delete the superseded object when it writes the new one,
+// so this repair leaves nothing orphaned in the bucket.
+// Bumped from v015 when the Office renderer learned to scan past slide 1 for
+// text: rows the previous build recorded as FAILED are never reconsidered on
+// their own, so improving the renderer only reaches existing files if their
+// verdict is cleared once. Re-running the same reset is safe — every affected
+// row is simply re-rendered by the gallery's backfill.
+const V015_MIGRATION_NAME = 'v017_reset_blank_office_thumbnails';
+const ZIP_BACKED_OFFICE_EXTENSIONS = ['docx', 'pptx', 'xlsx', 'odt', 'ods', 'odp'];
+
+async function resetOfficeThumbnailStatus(): Promise<void> {
+  const checkpoint = await sql
+    .prepare('SELECT 1 FROM __migrations WHERE name = ?')
+    .bindParams(V015_MIGRATION_NAME)
+    .execute();
+  if ((checkpoint.rows as unknown[]).length > 0) return;
+
+  const placeholders = ZIP_BACKED_OFFICE_EXTENSIONS.map(() => '?').join(', ');
+  await sql
+    .prepare(
+      `UPDATE attachments SET thumbnail_status = NULL WHERE extension IN (${placeholders})`
+    )
+    .bindParams(...ZIP_BACKED_OFFICE_EXTENSIONS)
+    .execute();
+
+  await sql.prepare('INSERT INTO __migrations (name) VALUES (?)').bindParams(V015_MIGRATION_NAME).execute();
+}
+
 /**
  * Idempotent ALTER ... ADD COLUMN, checkpointed exactly like migrationRunner
  * would. Used INSTEAD of migrationRunner.enqueue for every column addition —
@@ -261,4 +299,5 @@ export async function applySchemaMigrations(): Promise<void> {
   await migrations.run();
   await reconcileAddedColumns(V013_MIGRATION_NAME, 'attachments', ATTACHMENTS_STORAGE_KEY_COLUMNS);
   await reconcileAddedColumns(V014_MIGRATION_NAME, 'migration_items', MIGRATION_ITEM_THUMBNAIL_COLUMNS);
+  await resetOfficeThumbnailStatus();
 }

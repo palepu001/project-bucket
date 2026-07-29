@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react';
 import { Attachment, classifyExtension } from '../types';
 import { FileIcon } from './FileIcon';
 import { formatBytes, formatDate } from '../utils/format';
@@ -25,11 +26,26 @@ export function AttachmentCard({
   const category = classifyExtension(attachment.extension);
   const warningHint = WARNING_HINTS[attachment.syncStatus];
 
+  // A presigned thumbnail URL can stop working while the panel is open — it
+  // expires after an hour, and the object can be removed underneath us. Without
+  // this the card would paint the browser's broken-image glyph; falling back to
+  // the file-type icon keeps the grid looking deliberate either way. Reset on
+  // url change so a re-minted URL gets a fresh chance.
+  const [thumbnailBroken, setThumbnailBroken] = useState(false);
+  useEffect(() => setThumbnailBroken(false), [thumbnailUrl]);
+  const showThumbnail = Boolean(thumbnailUrl) && !thumbnailBroken;
+
   return (
     <div className="pb-card" title={`${attachment.filename}\n${formatBytes(attachment.size)} · added by ${uploaderName}`}>
       <div className="pb-card-preview" onClick={onPreview} role="button" tabIndex={0} onKeyDown={(e) => e.key === 'Enter' && onPreview()} aria-label={`Preview ${attachment.filename}`}>
-        {thumbnailUrl ? (
-          <img className="pb-card-thumb" src={thumbnailUrl} alt="" loading="lazy" />
+        {showThumbnail ? (
+          <img
+            className="pb-card-thumb"
+            src={thumbnailUrl}
+            alt=""
+            loading="lazy"
+            onError={() => setThumbnailBroken(true)}
+          />
         ) : (
           <FileIcon category={category} extension={attachment.extension} />
         )}
