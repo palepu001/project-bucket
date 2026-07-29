@@ -1,6 +1,6 @@
 # Forge "Configurable validation"
 
-This project contains a Forge app written in Javascript that validates the input value of a Jira custom field using admin-provided RegExp.
+This project contains a Forge app written in Typescript that validates the input value of a Jira custom field using admin-provided RegExp.
 
 See [developer.atlassian.com/platform/forge/](https://developer.atlassian.com/platform/forge) for documentation and tutorials explaining Forge,
 including the [documentation of Forge custom fields](https://developer.atlassian.com/platform/forge/manifest-reference/#jira-custom-field).
