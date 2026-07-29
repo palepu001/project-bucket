@@ -72,7 +72,17 @@ export async function resolveMediaId(attachmentId: string): Promise<string | nul
 // longer contain any media afterwards are dropped wholesale, so no empty
 // grey placeholder frame is left behind. Returns the removal count so
 // callers can skip the write entirely when nothing matched.
-function stripMediaNodes(doc: AdfNode, shouldRemove: (mediaId: string) => boolean): { doc: AdfNode; removed: number } {
+// Walks one ADF document and replaces every attachment-backed media node
+// (`media` / `mediaInline` with attrs.type !== 'external') whose UUID the
+// predicate marks for removal.
+// If replacing children of mediaSingle / mediaGroup wrappers, the wrappers
+// are unwrapped and their text children are converted to standard paragraphs
+// so the ADF document schema remains valid.
+// Returns the replacement count so callers can skip the write when nothing matched.
+function replaceMediaNodes(
+  doc: AdfNode,
+  shouldRemove: (mediaId: string) => { remove: boolean; filename?: string }
+): { doc: AdfNode; removed: number } {
   let removed = 0;
 
   function cleanNodes(nodes: AdfNode[]): AdfNode[] {
@@ -80,19 +90,49 @@ function stripMediaNodes(doc: AdfNode, shouldRemove: (mediaId: string) => boolea
     for (const node of nodes) {
       if ((node.type === 'media' || node.type === 'mediaInline') && node.attrs?.type !== 'external') {
         const mediaId = typeof node.attrs?.id === 'string' ? node.attrs.id.toLowerCase() : null;
-        if (mediaId && shouldRemove(mediaId)) {
-          removed += 1;
-          continue;
+        if (mediaId) {
+          const match = shouldRemove(mediaId);
+          if (match.remove) {
+            removed += 1;
+            const filename = match.filename ?? 'Attachment';
+            kept.push({
+              type: 'text',
+              text: `📎 [${filename} migrated to Project Bucket]`,
+              marks: [
+                {
+                  type: 'em',
+                },
+              ],
+            });
+            continue;
+          }
         }
       }
 
       if (Array.isArray(node.content)) {
         const cleanedContent = cleanNodes(node.content);
-        if (
-          (node.type === 'mediaSingle' || node.type === 'mediaGroup') &&
-          !cleanedContent.some((child) => child.type === 'media')
-        ) {
-          removed += 1;
+        if (node.type === 'mediaSingle' || node.type === 'mediaGroup') {
+          const mediaChildren = cleanedContent.filter((child) => child.type === 'media');
+          const textChildren = cleanedContent.filter((child) => child.type === 'text');
+
+          if (textChildren.length > 0) {
+            // Replaced children are inline text elements. We extract them into a separate paragraph block.
+            kept.push({
+              type: 'paragraph',
+              content: textChildren,
+            });
+          }
+
+          if (mediaChildren.length > 0) {
+            // Keep remaining media elements in their original container wrapper
+            kept.push({
+              ...node,
+              content: mediaChildren,
+            });
+          } else if (textChildren.length === 0) {
+            // Fallback for empty wrappers with no text output
+            removed += 1;
+          }
           continue;
         }
         kept.push({ ...node, content: cleanedContent });
@@ -116,20 +156,17 @@ function isEffectivelyEmpty(doc: AdfNode): boolean {
 
 /**
  * Removes ADF media references to migrated (now deleted) native attachments
- * from the issue's description and comments.
+ * from the issue's description and comments, replacing them with a placeholder.
  *
- * `deletedMediaIds` are the UUIDs resolved before deletion. On top of those,
+ * `deletedMediaMap` maps UUIDs resolved before deletion to their filename. On top of those,
  * this also sweeps ORPHANED references — media nodes pointing at attachments
- * that no longer exist at all (e.g. left behind by migrations that ran before
- * this cleanup existed). The sweep is guarded: it only engages when the UUID
- * of EVERY surviving attachment resolved successfully, because only then can
- * "not in the live set" be trusted to mean "dead" rather than "we failed to
- * look it up". A wrongly kept dead card is cosmetic; a wrongly removed live
- * embed is not, so the sweep fails closed.
+ * that no longer exist at all. The sweep is guarded: it only engages when the UUID
+ * of EVERY surviving attachment resolved successfully.
  */
-export async function removeMediaReferences(issueId: string, deletedMediaIds: string[]): Promise<void> {
-  const deleted = new Set(deletedMediaIds.map((id) => id.toLowerCase()));
-
+export async function removeMediaReferences(
+  issueId: string,
+  deletedMediaMap: Record<string, string>
+): Promise<void> {
   const issueResponse = await api.asUser().requestJira(route`/rest/api/3/issue/${issueId}?fields=description,attachment`);
   if (!issueResponse.ok) {
     throw new Error(`Failed to load issue ${issueId} for media cleanup: HTTP ${issueResponse.status}`);
@@ -147,8 +184,16 @@ export async function removeMediaReferences(issueId: string, deletedMediaIds: st
     }
   }
 
-  const shouldRemove = (mediaId: string): boolean =>
-    deleted.has(mediaId) || (liveMediaIds !== null && !liveMediaIds.has(mediaId));
+  const shouldRemove = (mediaId: string): { remove: boolean; filename?: string } => {
+    const lowerId = mediaId.toLowerCase();
+    if (deletedMediaMap[lowerId] !== undefined) {
+      return { remove: true, filename: deletedMediaMap[lowerId] };
+    }
+    if (liveMediaIds !== null && !liveMediaIds.has(lowerId)) {
+      return { remove: true };
+    }
+    return { remove: false };
+  };
 
   await cleanDescription(issueId, issue.fields.description, shouldRemove);
   await cleanComments(issueId, shouldRemove);
@@ -157,10 +202,10 @@ export async function removeMediaReferences(issueId: string, deletedMediaIds: st
 async function cleanDescription(
   issueId: string,
   description: AdfNode | null,
-  shouldRemove: (mediaId: string) => boolean
+  shouldRemove: (mediaId: string) => { remove: boolean; filename?: string }
 ): Promise<void> {
   if (!description) return;
-  const { doc, removed } = stripMediaNodes(description, shouldRemove);
+  const { doc, removed } = replaceMediaNodes(description, shouldRemove);
   if (removed === 0) return;
 
   try {
@@ -179,7 +224,10 @@ async function cleanDescription(
   }
 }
 
-async function cleanComments(issueId: string, shouldRemove: (mediaId: string) => boolean): Promise<void> {
+async function cleanComments(
+  issueId: string,
+  shouldRemove: (mediaId: string) => { remove: boolean; filename?: string }
+): Promise<void> {
   const pageSize = 50;
   // Hard cap so one pathological issue can't keep a resolver invocation
   // paginating forever; 500 comments is far beyond any issue this app targets.
@@ -202,7 +250,7 @@ async function cleanComments(issueId: string, shouldRemove: (mediaId: string) =>
 
     for (const comment of page.comments) {
       if (!comment.body) continue;
-      const { doc, removed } = stripMediaNodes(comment.body, shouldRemove);
+      const { doc, removed } = replaceMediaNodes(comment.body, shouldRemove);
       if (removed === 0) continue;
 
       try {
