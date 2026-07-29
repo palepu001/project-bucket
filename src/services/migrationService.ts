@@ -513,15 +513,21 @@ async function deleteNativeCopiesAndCleanReferences(
   // Resolve each attachment's Media Services UUID BEFORE deleting it — the
   // content redirect this relies on stops answering once the attachment is
   // gone. See jiraContentCleanup.ts for the mechanics.
-  const mediaIds = (
-    await Promise.all(targets.map(({ item }) => resolveMediaId(item.jiraAttachmentId)))
-  ).filter((id): id is string => id !== null);
+  const mediaIdToFilename: Record<string, string> = {};
+  await Promise.all(
+    targets.map(async ({ item }) => {
+      const mediaId = await resolveMediaId(item.jiraAttachmentId);
+      if (mediaId) {
+        mediaIdToFilename[mediaId.toLowerCase()] = item.filename;
+      }
+    })
+  );
 
   const anyDeleted = await deleteNativeCopies(targets);
 
   if (anyDeleted) {
     try {
-      await removeMediaReferences(issueId, mediaIds);
+      await removeMediaReferences(issueId, mediaIdToFilename);
     } catch (error) {
       // Cleanup is cosmetic housekeeping; the migration itself already
       // succeeded, so a failure here must never change the run's outcome.

@@ -94,7 +94,15 @@ async function presentDetectionPopup(context: WatcherContext, session: Session):
   activeDetectionFlag?.close();
   activeDetectionFlag = null;
 
-  const allItems = accumulatedSessions.flatMap((s) => s.items);
+  // Deduplicate items by jiraAttachmentId to prevent double-counting or double-migrating
+  // when multiple sessions are claimed concurrently during a single upload burst
+  const uniqueItemsMap = new Map<string, SessionItem>();
+  for (const s of accumulatedSessions) {
+    for (const item of s.items) {
+      uniqueItemsMap.set(item.jiraAttachmentId, item);
+    }
+  }
+  const allItems = Array.from(uniqueItemsMap.values());
   const count = allItems.length;
   const filenames = allItems.map((item) => item.filename).join(', ');
   const title = count === 1 ? '1 new native attachment detected' : `${count} new native attachments detected`;
