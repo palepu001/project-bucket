@@ -72,6 +72,10 @@ export function getStorageAudit(issueId: string): Promise<StorageAuditItem[]> {
   return callResolver('getStorageAudit', { issueId });
 }
 
+// Removes every copy Project Bucket owns: the stored object, its generated
+// preview image, the metadata row and the Teamwork Graph object. Nothing in
+// Jira is touched — a native attachment the customer chose not to link stays
+// exactly where they left it.
 export function deleteAttachment(attachmentId: string): Promise<{ success: true }> {
   return callResolver('deleteAttachment', { attachmentId });
 }

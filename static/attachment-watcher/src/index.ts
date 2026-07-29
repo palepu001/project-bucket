@@ -116,6 +116,7 @@ async function presentDetectionPopup(context: WatcherContext, session: Session):
 }
 
 async function runMigrationForSession(context: WatcherContext, session: Session): Promise<void> {
+  console.log('[ProjectBucket] runMigrationForSession: starting, session.id =', session.id, 'items =', session.items.length);
   try {
     const run = await beginMigration({
       issueId: context.issueId,
@@ -123,10 +124,13 @@ async function runMigrationForSession(context: WatcherContext, session: Session)
       sessionId: session.id,
       items: session.items.map((item) => ({ jiraAttachmentId: item.jiraAttachmentId, filename: item.filename })),
     });
+    console.log('[ProjectBucket] runMigrationForSession: beginMigration ok, run.id =', run.id, 'run.status =', run.status);
     const finished = await runMigration(run);
+    console.log('[ProjectBucket] runMigrationForSession: runMigration finished, status =', finished.status);
     await presentSummaryFlag(context, finished);
     await maybeRefreshIssueView(finished);
   } catch (error) {
+    console.error('[ProjectBucket] runMigrationForSession: CAUGHT ERROR:', error);
     showFlag({
       id: `pb-migration-error-${session.id}`,
       title: 'Linking to Project Bucket failed',

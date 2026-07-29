@@ -61,6 +61,13 @@ export class S3StorageProvider implements AttachmentStorageProvider {
       ChecksumSHA256: request.checksum,
     });
 
+    // getSignedUrl hoists every x-amz-* header into the presigned URL's query
+    // string by default. A hoisted checksum still produces a valid signature,
+    // but S3 only computes and stores a server-side checksum for the object
+    // when x-amz-checksum-sha256 arrives as an actual request header — a
+    // hoisted query parameter doesn't trigger that computation. Keep it
+    // unhoisted (a real signed header) so the client sends the same header
+    // that was signed, and S3 records a checksum exists() can verify later.
     const url = await getSignedUrl(this.s3, command, {
       expiresIn: 3600,
       unhoistableHeaders: new Set(['x-amz-checksum-sha256']),
@@ -124,7 +131,13 @@ export class S3StorageProvider implements AttachmentStorageProvider {
     const settled = await mapSettledWithConcurrency(
       refs,
       async (ref) => {
-        const metadata = await this.s3.send(new HeadObjectCommand({ Bucket: this.bucket, Key: ref }));
+        // ChecksumMode: 'ENABLED' is required for HeadObject to return the
+        // stored checksum at all — without it S3 omits ChecksumSHA256 from
+        // the response even when the object has one, which always fails the
+        // audit's checksum comparison regardless of what was actually stored.
+        const metadata = await this.s3.send(
+          new HeadObjectCommand({ Bucket: this.bucket, Key: ref, ChecksumMode: 'ENABLED' })
+        );
         return { ref, metadata };
       },
       10

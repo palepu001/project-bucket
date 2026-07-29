@@ -1,7 +1,13 @@
 import { useEffect, useState } from 'react';
 import * as api from '../api/resolvers';
 import { Attachment } from '../types';
-import { canRenderThumbnail, generateThumbnail, thumbnailFilenameFor } from '../services/thumbnailService';
+import {
+  canRenderThumbnail,
+  generateThumbnail,
+  generateThumbnailFromUrl,
+  requiresUrlSource,
+  thumbnailFilenameFor,
+} from '../services/thumbnailService';
 import { SequentialHashEngine } from '../security/SequentialHashEngine';
 
 // Resolves the gallery's thumbnail images in one batched round-trip.
@@ -14,6 +20,22 @@ import { SequentialHashEngine } from '../security/SequentialHashEngine';
 //
 // The URLs are short-lived. The effect re-runs on every attachments refresh,
 // which re-mints them long before they can expire during normal use.
+//
+// The resolver rejects more than 100 ids in one call, so requests are chunked.
+// That limit used to be unreachable in practice — only images and PDFs had a
+// rendition — but now that nearly every file gets one, an issue with 100+
+// attachments would otherwise fail the whole request and drop the entire grid
+// back to file-type icons.
+const THUMBNAIL_URL_BATCH = 100;
+
+function chunk<T>(items: T[], size: number): T[][] {
+  const batches: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    batches.push(items.slice(index, index + size));
+  }
+  return batches;
+}
+
 export function useThumbnails(attachments: Attachment[]): Record<string, string> {
   const [urls, setUrls] = useState<Record<string, string>>({});
 
@@ -28,10 +50,9 @@ export function useThumbnails(attachments: Attachment[]): Record<string, string>
     }
 
     let cancelled = false;
-    api
-      .getThumbnailUrls(ids)
-      .then((result) => {
-        if (!cancelled) setUrls(result);
+    Promise.all(chunk(ids, THUMBNAIL_URL_BATCH).map((batch) => api.getThumbnailUrls(batch)))
+      .then((results) => {
+        if (!cancelled) setUrls(Object.assign({}, ...results));
       })
       .catch(() => {
         // Thumbnails are progressive enhancement — on failure the cards fall
@@ -46,16 +67,58 @@ export function useThumbnails(attachments: Attachment[]): Record<string, string>
   return urls;
 }
 
-// Attachments that predate the thumbnail feature, and every migrated
-// attachment (the migration path never has a local File to render from), carry
-// a null thumbnailStatus. This backfills them one at a time in the background:
-// pull the bytes through the content proxy — which reads via the storage
-// contract's stream(), so it works whatever the location is — render, upload,
-// and record the outcome.
+// ---------------------------------------------------------------------------
+// Backfill
+//
+// Attachments that predate the thumbnail feature, everything migrated by a
+// build that could not render its format, and the categories that can only be
+// rendered once their bytes are AT the storage location (video, SVG — see
+// requiresUrlSource) all arrive here with no rendition. This renders them in
+// the background, one file at a time, then refreshes so the new thumbnails
+// appear.
 //
 // Sequential and capped on purpose. This is invisible background repair
 // competing with the user's own actions for bandwidth, so it must not fan out.
+// ---------------------------------------------------------------------------
+
 const BACKFILL_PER_PASS = 3;
+
+// Ceiling for pulling a whole file back down purely to render a preview of it.
+// Anything larger keeps its icon rather than spending a user's bandwidth on
+// background repair — and only pre-existing rows can be affected anyway, since
+// the upload and migration paths render from bytes they already hold in memory,
+// with no size limit at all.
+const MAX_BACKFILL_FETCH_BYTES = 100 * 1024 * 1024;
+
+// The backend content proxy's own cap (MAX_PROXY_BYTES in the resolver). Only
+// relevant on the fallback path below.
+const MAX_PROXY_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Gets the original bytes for one attachment.
+ *
+ * Preferred route is a direct fetch of the storage location's presigned URL:
+ * it has no size ceiling and no base64 inflation. The app provisions its
+ * buckets with CORS (see bucketProvisioningService), so this is the normal
+ * case. A storage location without CORS rejects that fetch, and the backend
+ * content proxy — which reads through the storage contract's stream() and so
+ * works anywhere — is the fallback, at the cost of its 10 MB cap.
+ */
+async function fetchOriginalBytes(attachment: Attachment, url: string): Promise<Blob | null> {
+  if (attachment.size <= MAX_BACKFILL_FETCH_BYTES) {
+    try {
+      const response = await fetch(url);
+      if (response.ok) return await response.blob();
+    } catch {
+      // CORS, or a transient network failure — fall through to the proxy.
+    }
+  }
+
+  if (attachment.size > MAX_PROXY_BYTES) return null;
+  const content = await api.getFileContent(attachment.id);
+  if (!content.dataUrl) return null;
+  return (await fetch(content.dataUrl)).blob();
+}
 
 export function useThumbnailBackfill(attachments: Attachment[], onBackfilled: () => void): void {
   useEffect(() => {
@@ -72,12 +135,6 @@ export function useThumbnailBackfill(attachments: Attachment[], onBackfilled: ()
       )
       .slice(0, BACKFILL_PER_PASS);
 
-    // Files this build can never render (Office, video, archives) are NOT
-    // written back as UNSUPPORTED. canRenderThumbnail already excludes them
-    // from `pending` for free on every pass, so persisting that verdict would
-    // just spend a resolver call per file to learn what a Set lookup answers —
-    // and would bake today's format support into old rows, so a future build
-    // that can render them would skip them forever.
     if (pending.length === 0) return;
 
     let cancelled = false;
@@ -88,12 +145,14 @@ export function useThumbnailBackfill(attachments: Attachment[], onBackfilled: ()
       for (const attachment of pending) {
         if (cancelled) return;
         try {
-          const content = await api.getFileContent(attachment.id);
+          // One URL serves both routes: the URL-sourced renderers draw straight
+          // from it (a <video> streams only the bytes it needs to decode the
+          // first frame), and the byte-sourced ones download through it.
+          const target = await api.getDownloadUrl(attachment.id, 'inline');
           if (cancelled) return;
-          if (!content.dataUrl) {
-            // 'too-large' (the proxy's 10 MB cap) or 'not-found' — a fact about
-            // these specific bytes, not the format, so it records as FAILED and
-            // is not reconsidered on later passes.
+          if (target.unavailable || !target.url) {
+            // The bytes are gone. That is a fact about this row, not about the
+            // format, so record it as permanent and stop reconsidering it.
             await api.recordThumbnail({
               attachmentId: attachment.id,
               thumbnailKey: null,
@@ -103,22 +162,29 @@ export function useThumbnailBackfill(attachments: Attachment[], onBackfilled: ()
             continue;
           }
 
-          const source = await (await fetch(content.dataUrl)).blob();
-          const { blob, status } = await generateThumbnail(source, attachment.filename, attachment.mimeType);
+          const result = requiresUrlSource(attachment.filename, attachment.mimeType)
+            ? await generateThumbnailFromUrl(target.url, attachment.filename, attachment.mimeType)
+            : await renderFromBytes(attachment, target.url);
           if (cancelled) return;
 
-          if (!blob) {
-            await api.recordThumbnail({ attachmentId: attachment.id, thumbnailKey: null, thumbnailStatus: status });
+          if (!result.blob) {
+            await api.recordThumbnail({
+              attachmentId: attachment.id,
+              thumbnailKey: null,
+              // A null status here would mean "not attempted", which would put
+              // this row straight back in the queue on the next pass.
+              thumbnailStatus: result.status ?? 'FAILED',
+            });
             changed = true;
             continue;
           }
 
-          const [checksum] = await SequentialHashEngine.computeHashes([blob]);
-          const [target] = await api.invokeResolver<any>('uploadObjects', {
+          const [checksum] = await SequentialHashEngine.computeHashes([result.blob]);
+          const [uploadTarget] = await api.invokeResolver<any>('uploadObjects', {
             objects: [
               {
                 filename: thumbnailFilenameFor(attachment.filename),
-                size: blob.size,
+                size: result.blob.size,
                 mimeType: 'image/jpeg',
                 checksum,
               },
@@ -126,18 +192,18 @@ export function useThumbnailBackfill(attachments: Attachment[], onBackfilled: ()
             issueId: attachment.issueId,
             projectId: attachment.projectId,
           });
-          if (cancelled || !target?.success) continue;
+          if (cancelled || !uploadTarget?.success) continue;
 
-          const response = await fetch(target.url, {
-            method: target.method || 'PUT',
-            body: blob,
-            headers: target.headers || {},
+          const response = await fetch(uploadTarget.url, {
+            method: uploadTarget.method || 'PUT',
+            body: result.blob,
+            headers: uploadTarget.headers || {},
           });
           if (!response.ok) throw new Error(`HTTP error ${response.status}`);
 
           await api.recordThumbnail({
             attachmentId: attachment.id,
-            thumbnailKey: target.key,
+            thumbnailKey: uploadTarget.key,
             thumbnailStatus: 'READY',
           });
           changed = true;
@@ -155,4 +221,12 @@ export function useThumbnailBackfill(attachments: Attachment[], onBackfilled: ()
       cancelled = true;
     };
   }, [attachments, onBackfilled]);
+}
+
+async function renderFromBytes(attachment: Attachment, url: string) {
+  const source = await fetchOriginalBytes(attachment, url);
+  // Unreachable bytes are a fact about this row, not the format: record it as
+  // permanent rather than re-downloading the same file on every gallery open.
+  if (!source) return { blob: null, status: 'FAILED' as const };
+  return generateThumbnail(source, attachment.filename, attachment.mimeType);
 }

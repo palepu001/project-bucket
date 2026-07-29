@@ -170,6 +170,20 @@ resolver.define('recordThumbnail', async (req) => {
   await verifyIssueAccess(attachment.issueId);
 
   await attachmentRepository.updateThumbnail(attachmentId, thumbnailKey ?? null, thumbnailStatus);
+
+  // Nothing references the rendition we just replaced, so without this it would
+  // sit in the bucket forever. Best-effort: the row already points at the new
+  // object, and failing the call would only make the panel re-render a preview
+  // that is already correct.
+  const superseded = attachment.thumbnailKey;
+  if (superseded && superseded !== thumbnailKey) {
+    try {
+      const provider = await getStorageProvider({ projectId: attachment.projectId });
+      await provider.delete(superseded);
+    } catch (err) {
+      console.warn(`[ProjectBucket] Could not delete the superseded thumbnail for ${attachmentId}:`, err);
+    }
+  }
   return { success: true };
 });
 
@@ -273,11 +287,19 @@ resolver.define('getStorageAudit', async (req) => {
   });
 });
 
+// Deleting a file in Project Bucket removes every copy Project Bucket owns:
+// the stored object, the generated preview image (a second object under the
+// same row), the SQL row, and the Teamwork Graph metadata object.
+//
+// Deliberately NOT in scope: anything in Jira. A native attachment that still
+// exists is one the migration either already confirmed deleted, or one the
+// customer chose not to link when the detection popup offered — and that
+// choice is theirs to keep. Jira's own attachment list is Jira's to manage.
 resolver.define('deleteAttachment', async (req) => {
   const { attachmentId } = req.payload as { attachmentId: string };
   const attachment = await attachmentRepository.getAttachmentById(attachmentId);
   if (!attachment) throw new Error(`Attachment "${attachmentId}" was not found`);
-  
+
   await verifyIssueAccess(attachment.issueId);
 
   // Delete the object first. If this throws we normally keep the SQL row so

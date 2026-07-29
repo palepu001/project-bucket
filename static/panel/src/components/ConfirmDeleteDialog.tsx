@@ -16,8 +16,8 @@ export function ConfirmDeleteDialog({
       <div className="pb-modal pb-modal-small">
         <h3 id="pb-delete-title">Delete attachment?</h3>
         <p>
-          This permanently deletes <strong>{attachment.filename}</strong> from Project Bucket — the file and its
-          metadata cannot be recovered.
+          This permanently deletes <strong>{attachment.filename}</strong> from Project Bucket — the file, its generated
+          preview image and its metadata cannot be recovered.
         </p>
         <div className="pb-modal-actions">
           <button className="pb-button pb-button-subtle" onClick={onCancel} disabled={busy}>

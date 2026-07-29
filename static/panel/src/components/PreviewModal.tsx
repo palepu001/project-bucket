@@ -8,6 +8,7 @@ import { TextPreview } from './previews/TextPreview';
 import { VideoPreview } from './previews/VideoPreview';
 import { AudioPreview } from './previews/AudioPreview';
 import { OfficePreview } from './previews/OfficePreview';
+import { RenditionPreview } from './previews/RenditionPreview';
 import { UnsupportedPreview } from './previews/UnsupportedPreview';
 import { UnavailablePreview } from './previews/UnavailablePreview';
 
@@ -103,10 +104,11 @@ export function PreviewModal({
           return <UnsupportedPreview attachment={attachment} onDownload={() => onDownload(attachment)} />;
         }
         return (
-          <div className="pb-pdf-preview">
-            <ImagePreview url={thumbnailUrl} alt={attachment.filename} />
-            <p className="pb-state-detail">Showing page 1 — download the file to read all pages.</p>
-          </div>
+          <RenditionPreview
+            url={thumbnailUrl}
+            alt={attachment.filename}
+            caption="Showing page 1 — download the file to read all pages."
+          />
         );
       case 'DOCUMENTS':
         if (attachment.extension.toLowerCase() === 'csv') {
@@ -116,10 +118,42 @@ export function PreviewModal({
       case 'VIDEOS':
         return <VideoPreview url={url} mimeType={attachment.mimeType} poster={thumbnailUrl ?? undefined} />;
       case 'AUDIO':
-        return <AudioPreview url={url} mimeType={attachment.mimeType} />;
+        return <AudioPreview url={url} mimeType={attachment.mimeType} waveform={thumbnailUrl ?? undefined} />;
       case 'OFFICE':
+        // Neither Forge nor the browser can render an Office document, but the
+        // rendition we generated for it is a real look at its contents — the
+        // page image the authoring application embedded, or the document's own
+        // opening text. Showing that beats the metadata card by a distance;
+        // the card is still the fallback when there is no rendition.
+        if (thumbnailUrl) {
+          return (
+            <RenditionPreview
+              url={thumbnailUrl}
+              alt={attachment.filename}
+              caption="Preview of the document — download it to open the full file."
+            />
+          );
+        }
         return <OfficePreview attachment={attachment} url={url} onDownload={() => onDownload(attachment)} />;
+      case 'ARCHIVES':
+        // The rendition for an archive is its member listing, which is exactly
+        // what someone opening a .zip preview wants to see.
+        if (thumbnailUrl) {
+          return (
+            <RenditionPreview
+              url={thumbnailUrl}
+              alt={`Contents of ${attachment.filename}`}
+              caption="Contents of the archive — download it to extract the files."
+            />
+          );
+        }
+        return <UnsupportedPreview attachment={attachment} onDownload={() => onDownload(attachment)} />;
       default:
+        // Files with no known extension but a text MIME type still have
+        // readable content, and the text viewer is the honest way to show it.
+        if (attachment.mimeType?.startsWith('text/')) {
+          return <TextPreview attachmentId={attachment.id} extension={attachment.extension} />;
+        }
         return <UnsupportedPreview attachment={attachment} onDownload={() => onDownload(attachment)} />;
     }
   }

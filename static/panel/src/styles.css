@@ -207,6 +207,9 @@ body {
   width: 100%;
   height: 100%;
   object-fit: cover;
+  /* Renditions for text, documents and archives put the meaningful content at
+     the top of the card; centring the crop would show their middle. */
+  object-position: center top;
 }
 
 .pb-card-footer {
@@ -427,7 +430,8 @@ body {
   user-select: none;
 }
 
-.pb-pdf-preview {
+.pb-pdf-preview,
+.pb-rendition-preview {
   width: 100%;
   height: 100%;
   flex: 1;
@@ -435,6 +439,19 @@ body {
   flex-direction: column;
   align-items: center;
   overflow: auto;
+}
+
+/* The waveform sits above the transport controls for an audio file, so the
+   column has to lay them out rather than centre a single element. */
+.pb-audio-preview {
+  flex-direction: column;
+  gap: 16px;
+}
+
+.pb-audio-waveform {
+  max-width: 100%;
+  max-height: 260px;
+  border-radius: 3px;
 }
 
 .pb-pdf-canvas {
