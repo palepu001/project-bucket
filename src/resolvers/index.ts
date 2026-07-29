@@ -11,6 +11,7 @@ import { extensionOf, AttachmentThumbnailStatus } from '../types/attachment';
 import * as attachmentRepository from '../repositories/attachmentRepository';
 import * as sessionService from '../services/sessionService';
 import * as migrationService from '../services/migrationService';
+import { getIssueHierarchy } from '../services/jiraIssueHierarchy';
 import * as graphSyncService from '../services/graphSyncService';
 import * as storageConsistencyService from '../services/storageConsistencyService';
 
@@ -357,14 +358,14 @@ resolver.define('uploadObjects', async (req) => {
     throw new Error('uploadObjects requires issueId and projectId');
   }
   
-  // Resolve projectKey, issueKey, epicKey once per batch
-  const issueResponse = await api.asApp().requestJira(route`/rest/api/3/issue/${issueId}?fields=project,parent`);
-  const issueData = await issueResponse.json();
+  // Cached — a migration session calls this once per item for that item's
+  // thumbnail, all for the same issue. See services/jiraIssueHierarchy.ts.
+  const hierarchy = await getIssueHierarchy(issueId);
   const storageContext: StorageKeyContext = {
     cloudId: req.context.installContext.replace('ari:cloud:jira::site/', ''),
-    projectKey: issueData.fields.project.key,
-    issueKey: issueData.key,
-    epicKey: issueData.fields.parent ? issueData.fields.parent.key : null,
+    projectKey: hierarchy.projectKey,
+    issueKey: hierarchy.issueKey,
+    epicKey: hierarchy.epicKey,
   };
   
   const provider = await getStorageProvider({ projectId });
@@ -525,36 +526,76 @@ resolver.define('recordAttachments', async (req) => {
 resolver.define('pollPendingSession', async (req) => {
   const { issueId } = req.payload as { issueId: string };
   if (!issueId) throw new Error('pollPendingSession requires an issueId');
-  
+
   const session = await sessionService.pollForNotifiableSession(issueId);
   if (!session) return null;
 
+  console.log(`[ProjectBucket] pollPendingSession: claimed session ${session.id} for issue ${issueId} (${session.items.length} DB items)`);
+
   try {
-    // Instead of trusting only the items that happened to arrive before the quiet
-    // window closed, we actively sweep the issue for ALL native attachments.
-    // Because successful migrations delete the native copy, any attachment
-    // remaining on the issue is, by definition, unmigrated.
+    // Sweep the issue for ALL current native attachments rather than relying
+    // only on the items captured by the trigger. Because every successful
+    // migration deletes the native copy, any attachment still on the issue is,
+    // by definition, unmigrated and should be offered to the user.
+    //
+    // CRITICAL: if the sweep succeeds and returns 0 attachments there is
+    // nothing left to migrate (all have already been moved, or the session was
+    // triggered by an attachment that was immediately deleted). Returning null
+    // suppresses the popup and avoids creating a migration run whose every item
+    // will 404 in stageOne — the sequence that caused "Link All" to always
+    // fail: the session existed in the DB, but no Jira copy remained to download.
     const response = await api.asUser().requestJira(route`/rest/api/3/issue/${issueId}?fields=attachment`);
+    console.log(`[ProjectBucket] pollPendingSession: Jira sweep HTTP ${response.status} for issue ${issueId}`);
     if (response.ok) {
       const issue = await response.json();
       const nativeAttachments = issue.fields.attachment || [];
-      if (nativeAttachments.length > 0) {
-        session.items = nativeAttachments.map((a: any) => ({
-          id: randomUUID(),
-          sessionId: session.id,
-          jiraAttachmentId: a.id,
-          filename: a.filename,
-          size: a.size,
-          mimeType: a.mimeType,
-          authorAccountId: a.author?.accountId || 'unknown',
-          detectedAt: new Date().toISOString(),
-        }));
+      console.log(`[ProjectBucket] pollPendingSession: sweep found ${nativeAttachments.length} native attachment(s) on issue ${issueId}`);
+
+      if (nativeAttachments.length === 0) {
+        // The sweep authoritatively found nothing to migrate. Suppress the
+        // popup — the session is stale or all attachments were already linked.
+        console.log(`[ProjectBucket] pollPendingSession: suppressing session ${session.id} — no native attachments remain on issue`);
+        return null;
       }
+
+      // Replace the DB-captured items with the live sweep result so the popup
+      // names exactly the files Jira currently holds and so beginMigration
+      // references real, downloadable attachment IDs.
+      session.items = nativeAttachments.map((a: any) => ({
+        id: randomUUID(),
+        sessionId: session.id,
+        jiraAttachmentId: a.id,
+        filename: a.filename,
+        size: a.size,
+        mimeType: a.mimeType,
+        authorAccountId: a.author?.accountId || 'unknown',
+        detectedAt: new Date().toISOString(),
+      }));
+    } else {
+      // The sweep API call itself failed (non-OK response). Fall back to the
+      // DB-captured items so the popup still fires — better to attempt a
+      // migration that might 404 on a single file than to silently swallow the
+      // whole session. stageOne's 404 handling will fail the run gracefully.
+      console.warn(
+        `[ProjectBucket] Jira attachment sweep returned HTTP ${response.status} for issue ${issueId}; ` +
+        'falling back to trigger-captured session items.'
+      );
     }
   } catch (error) {
+    // Network or parse error — same fallback as above. Log the error so it
+    // appears in forge logs and can be diagnosed without suppressing the session.
     console.warn(`[ProjectBucket] Failed to sweep native attachments for session ${session.id}:`, error);
   }
 
+  // Only return the session if there are items to act on. If the fallback
+  // path left session.items empty (the trigger somehow recorded no items and
+  // the sweep failed), suppress the popup rather than showing an empty one.
+  if (!session.items || session.items.length === 0) {
+    console.log(`[ProjectBucket] pollPendingSession: suppressing session ${session.id} — items list is empty after fallback`);
+    return null;
+  }
+
+  console.log(`[ProjectBucket] pollPendingSession: returning session ${session.id} with ${session.items.length} item(s) to migrate`);
   return session;
 });
 
@@ -583,7 +624,10 @@ resolver.define('beginMigration', async (req) => {
     throw new Error('beginMigration requires issueId, projectId, and at least one item');
   }
   const triggeredBy = requireAccountId(req.context);
-  return migrationService.beginMigration({ issueId, projectId, sessionId: sessionId ?? null, triggeredBy, items });
+  console.log(`[ProjectBucket] beginMigration: issueId=${issueId} projectId=${projectId} items=${items.length} files=[${items.map(i => i.filename).join(', ')}]`);
+  const run = await migrationService.beginMigration({ issueId, projectId, sessionId: sessionId ?? null, triggeredBy, items });
+  console.log(`[ProjectBucket] beginMigration: created run ${run.id} with ${run.items.length} item(s)`);
+  return run;
 });
 
 resolver.define('getMigrationUploadTarget', async (req) => {
@@ -665,7 +709,10 @@ resolver.define('skipMissingMigrationItem', async (req) => {
 resolver.define('commitMigrationRun', async (req) => {
   const { migrationId } = req.payload as { migrationId: string };
   const actorAccountId = requireAccountId(req.context);
-  return migrationService.commitMigrationRun({ migrationId, actorAccountId });
+  console.log(`[ProjectBucket] commitMigrationRun: migrationId=${migrationId}`);
+  const result = await migrationService.commitMigrationRun({ migrationId, actorAccountId });
+  console.log(`[ProjectBucket] commitMigrationRun: run ${migrationId} finished with status=${result.status} migrated=${result.migratedCount} failed=${result.failedCount}`);
+  return result;
 });
 
 resolver.define('retryMigration', async (req) => {

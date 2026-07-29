@@ -10,7 +10,7 @@ import { getStorageProvider, ChecksumType } from '../storage';
 import { generateStorageKey, StorageKeyContext } from '../util/storageKey';
 import { FileNormalizer } from '../shared/security/normalizer';
 import { validateStateless } from '../shared/security/validators/statelessPipeline';
-import api, { route } from '@forge/api';
+import { getIssueHierarchy } from './jiraIssueHierarchy';
 import { AttachmentThumbnailStatus, extensionOf } from '../types/attachment';
 import { MigrationItemStatus, MigrationRun } from '../types/migration';
 
@@ -98,13 +98,16 @@ export async function getUploadTarget(params: {
 
   await migrationRepository.updateMigrationItem(params.itemId, { status: 'UPLOADING', startedAt: true });
 
-  const issueResponse = await api.asApp().requestJira(route`/rest/api/3/issue/${run.issueId}?fields=project,parent`);
-  const issueData = await issueResponse.json();
+  // Cached — every item in this run (and its thumbnail upload) asks for the
+  // same issue's hierarchy, which cannot change mid-run. See
+  // services/jiraIssueHierarchy.ts for why this used to be a per-item Jira
+  // round trip.
+  const hierarchy = await getIssueHierarchy(run.issueId);
   const storageContext: StorageKeyContext = {
     cloudId: params.cloudId,
-    projectKey: issueData.fields.project.key,
-    issueKey: issueData.key,
-    epicKey: issueData.fields.parent ? issueData.fields.parent.key : null,
+    projectKey: hierarchy.projectKey,
+    issueKey: hierarchy.issueKey,
+    epicKey: hierarchy.epicKey,
   };
 
   const objectKey = generateStorageKey(storageContext);
@@ -433,14 +436,8 @@ async function persistAndDeleteSession(
     );
   }
 
-  const issueResponse = await api.asApp().requestJira(route`/rest/api/3/issue/${run.issueId}?fields=project,parent`);
-  const issueData = await issueResponse.json();
-  const hierarchy = {
-    projectKey: issueData.fields.project.key,
-    issueKey: issueData.key,
-    epicKey: issueData.fields.parent ? issueData.fields.parent.key : null,
-  };
-  
+  const hierarchy = await getIssueHierarchy(run.issueId);
+
   const persisted: { item: StagedItem; attachmentId: string }[] = [];
   try {
     for (const item of items) {
