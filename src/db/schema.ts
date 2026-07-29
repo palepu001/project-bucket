@@ -30,9 +30,15 @@ CREATE TABLE IF NOT EXISTS attachments (
 // the attachment's status badge (src/types/attachment.ts AttachmentSyncStatus).
 // Kept separate from the ACTIVE/DELETED lifecycle `status` column above.
 // Backfills existing rows to 'READY' via the column default.
-const ADD_ATTACHMENTS_SYNC_STATUS = `
-ALTER TABLE attachments
-  ADD COLUMN sync_status VARCHAR(16) NOT NULL DEFAULT 'READY'`;
+//
+// Routed through reconcileAddedColumns (not migrationRunner.enqueue) for the
+// same reason v013/v014 are: it's an ALTER ... ADD COLUMN, which the runner's
+// two-round-trip checkpoint (DDL, then a SEPARATE insert into __migrations)
+// can wedge permanently — see the v013 note below for the full mechanism.
+const ATTACHMENTS_SYNC_STATUS_COLUMNS: { name: string; addColumnDdl: string }[] = [
+  { name: 'sync_status', addColumnDdl: "ALTER TABLE attachments ADD COLUMN sync_status VARCHAR(16) NOT NULL DEFAULT 'READY'" },
+];
+const V006_MIGRATION_NAME = 'v006_add_attachments_sync_status';
 
 const CREATE_SESSIONS_TABLE = `
 CREATE TABLE IF NOT EXISTS attachment_sessions (
@@ -97,12 +103,16 @@ CREATE TABLE IF NOT EXISTS migration_items (
 // Jira copy for the WHOLE session at once) needs to recover each staged item's
 // object key + verified metadata. These columns carry that staged state across
 // the separate resolver calls; they stay NULL until the item reaches STAGED.
-const ADD_MIGRATION_ITEMS_STAGING = `
-ALTER TABLE migration_items
-  ADD COLUMN object_key VARCHAR(500) NULL,
-  ADD COLUMN mime_type VARCHAR(200) NULL,
-  ADD COLUMN size_bytes BIGINT NULL,
-  ADD COLUMN checksum VARCHAR(128) NULL`;
+//
+// Routed through reconcileAddedColumns for the same wedge risk as
+// ATTACHMENTS_SYNC_STATUS_COLUMNS above — see the v013 note below.
+const MIGRATION_ITEMS_STAGING_COLUMNS: { name: string; addColumnDdl: string }[] = [
+  { name: 'object_key', addColumnDdl: 'ALTER TABLE migration_items ADD COLUMN object_key VARCHAR(500) NULL' },
+  { name: 'mime_type', addColumnDdl: 'ALTER TABLE migration_items ADD COLUMN mime_type VARCHAR(200) NULL' },
+  { name: 'size_bytes', addColumnDdl: 'ALTER TABLE migration_items ADD COLUMN size_bytes BIGINT NULL' },
+  { name: 'checksum', addColumnDdl: 'ALTER TABLE migration_items ADD COLUMN checksum VARCHAR(128) NULL' },
+];
+const V007_MIGRATION_NAME = 'v007_add_migration_items_staging';
 
 // F7 — Teamwork Graph connections. One row per connection the admin creates
 // under Apps > Connected apps > Project Bucket > Connections. The connectionId
@@ -130,44 +140,68 @@ CREATE TABLE IF NOT EXISTS graph_delete_outbox (
 // The reconciliation sweep's root task id must be reused across
 // scheduleOrUpdateTask calls (per the orchestration docs) to avoid duplicate
 // schedules — persist it alongside the connection it belongs to.
-const ADD_GRAPH_CONNECTIONS_TASK_ID = `
-ALTER TABLE graph_connections
-  ADD COLUMN task_id VARCHAR(64) NULL`;
+//
+// Routed through reconcileAddedColumns for the same wedge risk as
+// ATTACHMENTS_SYNC_STATUS_COLUMNS above — see the v013 note below.
+const GRAPH_CONNECTIONS_TASK_ID_COLUMNS: { name: string; addColumnDdl: string }[] = [
+  { name: 'task_id', addColumnDdl: 'ALTER TABLE graph_connections ADD COLUMN task_id VARCHAR(64) NULL' },
+];
+const V010_MIGRATION_NAME = 'v010_add_graph_connections_task_id';
 
 // Two-strike quarantine marker: the timestamp of the first consistency sweep
 // that found a row's bytes missing. The sweep quarantines (ACTIVE → ORPHANED)
 // only on a second consecutive miss, so one transient/regressed existence check
 // can no longer mass-quarantine a live library. NULL = bytes were present.
-const ADD_ATTACHMENTS_MISSING_SINCE = `
-ALTER TABLE attachments
-  ADD COLUMN missing_since DATETIME NULL`;
+//
+// Routed through reconcileAddedColumns for the same wedge risk as
+// ATTACHMENTS_SYNC_STATUS_COLUMNS above — see the v013 note below.
+const ATTACHMENTS_MISSING_SINCE_COLUMNS: { name: string; addColumnDdl: string }[] = [
+  { name: 'missing_since', addColumnDdl: 'ALTER TABLE attachments ADD COLUMN missing_since DATETIME NULL' },
+];
+const V011_MIGRATION_NAME = 'v011_add_attachments_missing_since';
 
 // Rendered preview image for an attachment, generated in the browser at upload
 // time and stored as an ordinary object through the same storage contract as
 // the file itself. `thumbnail_key` is an opaque adapter handle exactly like
 // `object_key`. Both columns stay NULL for rows that predate this feature and
 // for migrated attachments; the gallery fills them in lazily on first view.
-const ADD_ATTACHMENTS_THUMBNAIL = `
-ALTER TABLE attachments
-  ADD COLUMN thumbnail_key VARCHAR(500) NULL,
-  ADD COLUMN thumbnail_status VARCHAR(16) NULL`;
+//
+// Routed through reconcileAddedColumns for the same wedge risk as
+// ATTACHMENTS_SYNC_STATUS_COLUMNS above — see the v013 note below.
+const ATTACHMENTS_THUMBNAIL_COLUMNS: { name: string; addColumnDdl: string }[] = [
+  { name: 'thumbnail_key', addColumnDdl: 'ALTER TABLE attachments ADD COLUMN thumbnail_key VARCHAR(500) NULL' },
+  { name: 'thumbnail_status', addColumnDdl: 'ALTER TABLE attachments ADD COLUMN thumbnail_status VARCHAR(16) NULL' },
+];
+const V012_MIGRATION_NAME = 'v012_add_attachments_thumbnail';
 
 // S3 Migration columns. To support building deterministic object keys for S3
 // and routing between Instance/Project buckets, we need these additional properties.
 //
-// NOT run through migrationRunner.enqueue like the migrations above. The
-// runner checkpoints a migration by running its DDL and then, in a SEPARATE
-// round-trip, inserting a row into __migrations — so a container that dies
-// (or a request that times out) between those two calls leaves the ALTER
-// applied with no checkpoint recorded. The runner keys strictly on name, so
-// every subsequent run() re-issues the same ALTER ... ADD COLUMN against
-// columns that already exist, which MySQL rejects as "Duplicate column
-// name". That name can then never succeed again through the normal path.
-// This happened to v013 in production. reconcileAttachmentsStorageKeys below
-// replaces it with an idempotent check (only add columns that are actually
+// NOT run through migrationRunner.enqueue like the CREATE TABLE statements
+// above. The runner checkpoints a migration by running its DDL and then, in a
+// SEPARATE round-trip, inserting a row into __migrations — so a container
+// that dies (or a request that times out) between those two calls leaves the
+// ALTER applied with no checkpoint recorded. The runner keys strictly on
+// name, so every subsequent run() re-issues the same ALTER ... ADD COLUMN
+// against columns that already exist, which MySQL rejects as "Duplicate
+// column name". That name can then never succeed again through the normal
+// path, which wedges applySchemaMigrations() for good (see ensureSchema's
+// cooldown in db/client.ts) — every resolver that touches Forge SQL,
+// including the attachment watcher's 2s pollPendingSession heartbeat, starts
+// failing immediately.
+//
+// This happened to v013 in production. reconcileAddedColumns below replaces
+// the runner with an idempotent check (only add columns that are actually
 // missing) and writes the SAME checkpoint row the runner would have, so
 // tooling that lists __migrations still sees v013_add_attachments_storage_keys
 // as applied.
+//
+// EVERY ALTER ... ADD COLUMN migration carries this exact risk, not just this
+// one — v006, v007, v010, v011, and v012 above were originally wired through
+// migrationRunner.enqueue too and were just as capable of wedging permanently;
+// they were retrofitted onto this same path once the failure mode above was
+// understood to be systemic rather than specific to v013. Any FUTURE column
+// addition belongs here as well — never back on migrationRunner.enqueue.
 const ATTACHMENTS_STORAGE_KEY_COLUMNS: { name: string; addColumnDdl: string }[] = [
   { name: 'project_key', addColumnDdl: 'ALTER TABLE attachments ADD COLUMN project_key VARCHAR(255) NULL' },
   { name: 'issue_key', addColumnDdl: 'ALTER TABLE attachments ADD COLUMN issue_key VARCHAR(255) NULL' },
@@ -281,22 +315,29 @@ async function reconcileAddedColumns(
   await sql.prepare('INSERT INTO __migrations (name) VALUES (?)').bindParams(migrationName).execute();
 }
 
+// Only CREATE TABLE IF NOT EXISTS statements belong in this chain — they are
+// safe to re-run unconditionally. Every ALTER ... ADD COLUMN migration goes
+// through reconcileAddedColumns below instead (see the v013 note above for
+// why: migrationRunner's own checkpoint can wedge permanently on a re-run).
 const migrations = migrationRunner
   .enqueue('v001_create_attachments_table', CREATE_ATTACHMENTS_TABLE)
   .enqueue('v002_create_attachment_sessions_table', CREATE_SESSIONS_TABLE)
   .enqueue('v003_create_attachment_session_items_table', CREATE_SESSION_ITEMS_TABLE)
   .enqueue('v004_create_migration_runs_table', CREATE_MIGRATION_RUNS_TABLE)
   .enqueue('v005_create_migration_items_table', CREATE_MIGRATION_ITEMS_TABLE)
-  .enqueue('v006_add_attachments_sync_status', ADD_ATTACHMENTS_SYNC_STATUS)
-  .enqueue('v007_add_migration_items_staging', ADD_MIGRATION_ITEMS_STAGING)
   .enqueue('v008_create_graph_connections_table', CREATE_GRAPH_CONNECTIONS_TABLE)
-  .enqueue('v009_create_graph_delete_outbox_table', CREATE_GRAPH_DELETE_OUTBOX_TABLE)
-  .enqueue('v010_add_graph_connections_task_id', ADD_GRAPH_CONNECTIONS_TASK_ID)
-  .enqueue('v011_add_attachments_missing_since', ADD_ATTACHMENTS_MISSING_SINCE)
-  .enqueue('v012_add_attachments_thumbnail', ADD_ATTACHMENTS_THUMBNAIL);
+  .enqueue('v009_create_graph_delete_outbox_table', CREATE_GRAPH_DELETE_OUTBOX_TABLE);
 
 export async function applySchemaMigrations(): Promise<void> {
   await migrations.run();
+  // Column additions, in their original v-numbered order. Each table involved
+  // (attachments, migration_items, graph_connections) is created by the
+  // CREATE TABLE chain above before its columns are added here.
+  await reconcileAddedColumns(V006_MIGRATION_NAME, 'attachments', ATTACHMENTS_SYNC_STATUS_COLUMNS);
+  await reconcileAddedColumns(V007_MIGRATION_NAME, 'migration_items', MIGRATION_ITEMS_STAGING_COLUMNS);
+  await reconcileAddedColumns(V010_MIGRATION_NAME, 'graph_connections', GRAPH_CONNECTIONS_TASK_ID_COLUMNS);
+  await reconcileAddedColumns(V011_MIGRATION_NAME, 'attachments', ATTACHMENTS_MISSING_SINCE_COLUMNS);
+  await reconcileAddedColumns(V012_MIGRATION_NAME, 'attachments', ATTACHMENTS_THUMBNAIL_COLUMNS);
   await reconcileAddedColumns(V013_MIGRATION_NAME, 'attachments', ATTACHMENTS_STORAGE_KEY_COLUMNS);
   await reconcileAddedColumns(V014_MIGRATION_NAME, 'migration_items', MIGRATION_ITEM_THUMBNAIL_COLUMNS);
   await resetOfficeThumbnailStatus();
