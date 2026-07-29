@@ -1,6 +1,6 @@
 import { view, showFlag, events, Modal } from '@forge/bridge';
 import { pollPendingSession, dismissSession, beginMigration, runMigration, retryMigration } from './migrationClient';
-import { MigrationRun, Session } from './types';
+import { MigrationRun, Session, SessionItem } from './types';
 
 // ---------------------------------------------------------------------------
 // Project Bucket attachment watcher.
@@ -61,6 +61,8 @@ interface JiraBackgroundScriptContext {
 }
 
 let polling = false;
+let activeDetectionFlag: { close: () => void } | null = null;
+let accumulatedSessions: Session[] = [];
 
 async function pollOnce(context: WatcherContext): Promise<void> {
   if (polling) return;
@@ -83,13 +85,23 @@ async function pollOnce(context: WatcherContext): Promise<void> {
 }
 
 async function presentDetectionPopup(context: WatcherContext, session: Session): Promise<void> {
-  const count = session.items.length;
-  const filenames = session.items.map((item) => item.filename).join(', ');
+  // If we already have accumulated sessions, append this one if not already present
+  if (!accumulatedSessions.some((s) => s.id === session.id)) {
+    accumulatedSessions.push(session);
+  }
+
+  // Close the previous flag if one is already open, preventing stacked popups.
+  activeDetectionFlag?.close();
+  activeDetectionFlag = null;
+
+  const allItems = accumulatedSessions.flatMap((s) => s.items);
+  const count = allItems.length;
+  const filenames = allItems.map((item) => item.filename).join(', ');
   const title = count === 1 ? '1 new native attachment detected' : `${count} new native attachments detected`;
   const linkActionText = count === 1 ? 'Link to Project Bucket' : 'Link All';
 
-  const flag = await showFlag({
-    id: `pb-session-${session.id}`,
+  activeDetectionFlag = await showFlag({
+    id: 'pb-session-merged',
     title,
     type: 'info',
     description: `${filenames} — link ${count === 1 ? 'this file' : 'all files'} to Project Bucket?`,
@@ -98,16 +110,30 @@ async function presentDetectionPopup(context: WatcherContext, session: Session):
       {
         text: linkActionText,
         onClick: async () => {
-          flag.close();
-          await runMigrationForSession(context, session);
+          activeDetectionFlag?.close();
+          activeDetectionFlag = null;
+
+          const sessionsToResolve = [...accumulatedSessions];
+          accumulatedSessions = []; // clear first to prevent concurrent poll races
+
+          await runMigrationForSessions(context, sessionsToResolve, allItems);
         },
       },
       {
         text: 'Cancel',
         onClick: async () => {
-          flag.close();
-          await dismissSession(session.id).catch((error) =>
-            console.error('[ProjectBucket] Failed to dismiss session:', error)
+          activeDetectionFlag?.close();
+          activeDetectionFlag = null;
+
+          const sessionsToDismiss = [...accumulatedSessions];
+          accumulatedSessions = []; // clear first to prevent concurrent poll races
+
+          await Promise.all(
+            sessionsToDismiss.map((s) =>
+              dismissSession(s.id).catch((error) =>
+                console.error('[ProjectBucket] Failed to dismiss session:', error)
+              )
+            )
           );
         },
       },
@@ -115,20 +141,37 @@ async function presentDetectionPopup(context: WatcherContext, session: Session):
   });
 }
 
-async function runMigrationForSession(context: WatcherContext, session: Session): Promise<void> {
+async function runMigrationForSessions(
+  context: WatcherContext,
+  sessions: Session[],
+  items: SessionItem[]
+): Promise<void> {
   try {
+    const primarySession = sessions[0];
     const run = await beginMigration({
       issueId: context.issueId,
       projectId: context.projectId,
-      sessionId: session.id,
-      items: session.items.map((item) => ({ jiraAttachmentId: item.jiraAttachmentId, filename: item.filename })),
+      sessionId: primarySession.id,
+      items: items.map((item) => ({ jiraAttachmentId: item.jiraAttachmentId, filename: item.filename })),
     });
+
+    // Dismiss the secondary sessions so they are marked as resolved/cleaned up in the DB
+    if (sessions.length > 1) {
+      await Promise.all(
+        sessions.slice(1).map((s) =>
+          dismissSession(s.id).catch((error) =>
+            console.error('[ProjectBucket] Failed to clean up secondary session during migration:', error)
+          )
+        )
+      );
+    }
+
     const finished = await runMigration(run);
     await presentSummaryFlag(context, finished);
     await maybeRefreshIssueView(finished);
   } catch (error) {
     showFlag({
-      id: `pb-migration-error-${session.id}`,
+      id: 'pb-migration-error-merged',
       title: 'Linking to Project Bucket failed',
       type: 'error',
       description: error instanceof Error ? error.message : String(error),
