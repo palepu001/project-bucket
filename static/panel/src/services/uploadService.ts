@@ -10,6 +10,65 @@ export interface UploadOutcome {
   failed: { filename: string; error: string }[];
 }
 
+// Lifecycle of one file as the panel paints it. These states drive the
+// optimistic placeholder cards/rows that appear the instant files are picked
+// (matching Jira, where the attachment tile shows up and then fills in):
+//   pending    — queued: validating / hashing / minting the upload target
+//   uploading  — bytes in flight; `loaded` tracks progress against `size`
+//   saving     — bytes landed, metadata being persisted (recordAttachments)
+//   done       — the real attachment row now exists
+//   failed     — validation or transfer failed; `error` explains why
+export type UploadItemPhase = 'pending' | 'uploading' | 'saving' | 'done' | 'failed';
+
+export interface UploadItemProgress {
+  id: string;
+  filename: string;
+  size: number;
+  loaded: number;
+  phase: UploadItemPhase;
+  error?: string;
+}
+
+export type UploadProgressCallback = (items: UploadItemProgress[]) => void;
+
+function tempId(): string {
+  const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
+  return c?.randomUUID ? c.randomUUID() : `upl-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+// PUTs a blob to a presigned target and reports byte-level progress.
+//
+// fetch() cannot report request-upload progress (there is no readable stream on
+// the request body across browsers), so the main-file transfer uses XMLHttp-
+// Request, whose upload.onprogress is the only portable source of a real upload
+// percentage. Same URL, method and headers as the fetch path — and the same
+// *.amazonaws.com connect-src the manifest already grants — so this is a
+// like-for-like swap that only adds the progress signal.
+function putObjectWithProgress(
+  body: Blob,
+  result: { success?: boolean; url: string; method?: string; headers?: Record<string, string> },
+  onProgress: (loaded: number) => void
+): Promise<boolean> {
+  if (!result || !result.success) return Promise.resolve(false);
+  return new Promise<boolean>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open(result.method || 'PUT', result.url);
+    const headers = result.headers || {};
+    for (const [name, value] of Object.entries(headers)) {
+      xhr.setRequestHeader(name, value);
+    }
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable) onProgress(event.loaded);
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) resolve(true);
+      else reject(new Error(`HTTP ${xhr.status}: ${xhr.responseText}`));
+    };
+    xhr.onerror = () => reject(new Error('Network error uploading to storage backend'));
+    xhr.send(body);
+  });
+}
+
 // The validation pipeline is created once and reused across all uploads —
 // validators are stateless, so a single instance is safe for the lifetime
 // of the panel. This avoids re-constructing the validator chain on every
@@ -40,7 +99,23 @@ const validationPipeline = createDefaultPipeline();
  * (UploadButton.tsx) see no difference except that failures now include
  * validation errors in addition to upload errors.
  */
-export async function uploadFiles(files: File[], issueId: string, projectId: string): Promise<UploadOutcome> {
+export async function uploadFiles(
+  files: File[],
+  issueId: string,
+  projectId: string,
+  onProgress?: UploadProgressCallback
+): Promise<UploadOutcome> {
+  // Optimistic progress registry: one entry per picked file, keyed by File
+  // identity so every phase transition below can find its entry. A fresh copy
+  // is emitted on each change (never the live objects) so React sees new
+  // references and re-renders the placeholders.
+  const progress = new Map<File, UploadItemProgress>();
+  for (const file of files) {
+    progress.set(file, { id: tempId(), filename: file.name, size: file.size, loaded: 0, phase: 'pending' });
+  }
+  const emit = () => onProgress?.(files.map((file) => ({ ...progress.get(file)! })));
+  emit();
+
   // --- Phase 1: Validate every file before any upload begins. ---
   // Validation runs sequentially per file (the pipeline itself is sequential),
   // but we validate all files up front so the user sees every validation
@@ -54,6 +129,10 @@ export async function uploadFiles(files: File[], issueId: string, projectId: str
       // The pipeline's message is user-facing and safe to display — no
       // stack traces, no internal details. See security/types.ts.
       failed.push({ filename: file.name, error: result.message });
+      const entry = progress.get(file)!;
+      entry.phase = 'failed';
+      entry.error = result.message;
+      emit();
     } else {
       validFiles.push(file);
     }
@@ -135,16 +214,33 @@ export async function uploadFiles(files: File[], issueId: string, projectId: str
   for (let i = 0; i < validFiles.length; i++) {
     const file = validFiles[i];
     const result = results[i];
+    const entry = progress.get(file)!;
 
     if (!result || !result.success) {
-      failed.push({ filename: file.name, error: result?.message || 'Backend validation rejected the payload' });
+      const message = result?.message || 'Backend validation rejected the payload';
+      failed.push({ filename: file.name, error: message });
+      entry.phase = 'failed';
+      entry.error = message;
+      emit();
       continue;
     }
 
+    entry.phase = 'uploading';
+    emit();
     try {
-      await putObject(file, result);
+      await putObjectWithProgress(file, result, (loaded) => {
+        entry.loaded = loaded;
+        emit();
+      });
+      entry.loaded = file.size;
+      entry.phase = 'saving';
+      emit();
     } catch (err: any) {
-      failed.push({ filename: file.name, error: err.message || 'Network error uploading to storage backend' });
+      const message = err.message || 'Network error uploading to storage backend';
+      failed.push({ filename: file.name, error: message });
+      entry.phase = 'failed';
+      entry.error = message;
+      emit();
       continue;
     }
 
@@ -190,6 +286,16 @@ export async function uploadFiles(files: File[], issueId: string, projectId: str
       thumbnailStatus: item.thumbnailStatus,
     })),
   });
+
+  // Metadata is persisted — the real rows now exist. Flip every survivor to
+  // done so its placeholder reads as complete for the instant before the
+  // gallery refresh replaces it with the real card/row.
+  for (const item of succeeded) {
+    const entry = progress.get(item.file)!;
+    entry.phase = 'done';
+    entry.loaded = item.file.size;
+  }
+  emit();
 
   return { created, failed };
 }

@@ -9,6 +9,7 @@ import {
 } from './repositories/graphConnectionRepository';
 import * as graphSyncService from './services/graphSyncService';
 import * as storageConsistencyService from './services/storageConsistencyService';
+import * as migrationService from './services/migrationService';
 import { recordDetectedAttachment } from './services/sessionService';
 
 export { handler } from './resolvers';
@@ -92,7 +93,13 @@ export const runSchemaMigration = async (): Promise<void> => {
 //      upserts, so republishing is idempotent. This is the app-owned check
 //      that metadata actually reaches the connector; it runs hourly and does
 //      not depend on the platform's 24h orchestration task being scheduled.
-// The two halves are isolated: a failure in one never blocks the other.
+//   3. Migrations: runs abandoned mid-flight converge to a terminal state.
+//      The whole migration pipeline is driven from the issue view, so a user
+//      who starts "Link All" and navigates to another issue leaves a run
+//      nothing in the browser will ever return to. This finishes the ones the
+//      backend can finish and cleanly aborts the rest — see
+//      migrationService.sweepAbandonedRuns.
+// The three halves are isolated: a failure in one never blocks the others.
 // ---------------------------------------------------------------------------
 export const runConsistencySweep = async (): Promise<void> => {
   await ensureSchema();
@@ -112,6 +119,24 @@ export const runConsistencySweep = async (): Promise<void> => {
     await graphSyncService.runReconciliationSweep();
   } catch (error) {
     console.error('[ProjectBucket] Consistency sweep: graph reconciliation failed:', error);
+  }
+
+  try {
+    const summary = await migrationService.sweepAbandonedRuns();
+    if (summary.examined > 0) {
+      console.log(
+        `[ProjectBucket] Consistency sweep: examined ${summary.examined} abandoned migration run(s) — ` +
+          `${summary.committed} completed, ${summary.aborted} aborted, ` +
+          `${summary.objectsReclaimed} staged object(s) reclaimed`
+      );
+    }
+    if (summary.needsAttention > 0) {
+      console.warn(
+        `[ProjectBucket] Consistency sweep: ${summary.needsAttention} half-committed migration run(s) need manual review`
+      );
+    }
+  } catch (error) {
+    console.error('[ProjectBucket] Consistency sweep: abandoned migration sweep failed:', error);
   }
 };
 

@@ -14,9 +14,14 @@ export function useAttachments(issueId: string | null, search: string) {
   const [state, setState] = useState<LoadState>('loading');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  const refresh = useCallback(async () => {
+  // `silent` re-fetches WITHOUT flipping to the loading spinner — used after an
+  // upload or delete, where we already have data on screen (and optimistic
+  // placeholders) and blanking the whole gallery to a spinner would be a jarring
+  // flash. The initial load and search changes stay non-silent so first paint
+  // and a new query still show progress.
+  const refresh = useCallback(async (opts?: { silent?: boolean }) => {
     if (!issueId) return;
-    setState('loading');
+    if (!opts?.silent) setState('loading');
     setErrorMessage(null);
     try {
       const result = await api.listAttachments({ issueId, search: search || undefined });

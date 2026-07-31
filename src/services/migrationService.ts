@@ -93,10 +93,12 @@ export async function getUploadTarget(params: {
   });
   if (!validation.passed) {
     await blockItem(params.itemId, item.filename, validation.message ?? 'File type is not allowed.');
+    await migrationRepository.touchRunActivity(params.migrationId);
     throw new Error(`"${item.filename}" cannot be migrated — ${validation.message}`);
   }
 
   await migrationRepository.updateMigrationItem(params.itemId, { status: 'UPLOADING', startedAt: true });
+  await migrationRepository.touchRunActivity(params.migrationId);
 
   // Cached — every item in this run (and its thumbnail upload) asks for the
   // same issue's hierarchy, which cannot change mid-run. See
@@ -173,6 +175,9 @@ export async function stageMigrationItem(params: {
     thumbnailKey: params.thumbnailKey ?? null,
     thumbnailStatus: params.thumbnailStatus ?? null,
   });
+  // Bump the run's heartbeat so the stale-run detector knows a browser is
+  // still actively driving this run.
+  await migrationRepository.touchRunActivity(params.migrationId);
   return { staged: true };
 }
 
@@ -214,6 +219,7 @@ export async function blockMigrationItem(params: {
     return { blocked: true };
   }
   await blockItem(params.itemId, item.filename, params.reason);
+  await migrationRepository.touchRunActivity(params.migrationId);
   return { blocked: true };
 }
 
@@ -249,6 +255,7 @@ export async function failMigrationItem(params: {
     errorMessage: params.error,
     completedAt: true,
   });
+  await migrationRepository.touchRunActivity(params.migrationId);
 }
 
 /**
@@ -285,6 +292,7 @@ export async function skipMissingMigrationItem(params: {
       errorMessage: `Downloading "${item.filename}" failed, but the attachment still exists in Jira`,
       completedAt: true,
     });
+    await migrationRepository.touchRunActivity(params.migrationId);
     return { skipped: false };
   }
 
@@ -293,6 +301,7 @@ export async function skipMissingMigrationItem(params: {
     errorMessage: 'The native Jira attachment no longer exists — it was deleted before it could be linked',
     completedAt: true,
   });
+  await migrationRepository.touchRunActivity(params.migrationId);
   return { skipped: true };
 }
 
@@ -360,29 +369,31 @@ export async function commitMigrationRun(params: {
   const run = await migrationRepository.getMigrationRun(params.migrationId);
   if (!run) throw new Error(`Migration run "${params.migrationId}" not found`);
 
-  const items = await migrationRepository.getStagedMigrationItems(params.migrationId);
-  const { action, present, blockedCount } = planCommit(items);
-
-  if (action === 'nothing-to-do') {
-    // Every item was withdrawn — sources vanished, files were blocked, or both.
-    // Nothing to do and nothing lost: blocked files are still in Jira. The run
-    // is complete with zero migrations, and failedCount surfaces the blocks.
-    await migrationRepository.setRunFinal(params.migrationId, 'COMPLETED', 0, blockedCount);
-  } else if (action === 'persist') {
-    await persistAndDeleteSession(run, present, params.actorAccountId, blockedCount);
-  } else if (action === 'retry-deletes') {
-    // Retry of a PARTIAL_FAILURE run: metadata already exists, only the native
-    // deletions need re-attempting. Re-run deletion for the lingering copies.
-    const lingering = items.filter((item) => item.status === 'SOURCE_DELETE_FAILED');
-    await deleteNativeCopiesAndCleanReferences(
-      run.issueId,
-      lingering.map((item) => ({ item, attachmentId: item.attachmentId! }))
+  // Mutual exclusion, not an optimisation. Two commits racing on the same run
+  // each see every item as STAGED, each plan 'persist', and each insert a full
+  // set of attachment rows — duplicating every file in the session and double-
+  // deleting the native copies. Only the lease holder may proceed.
+  const acquired = await migrationRepository.claimCommitLease(params.migrationId, COMMIT_LEASE_MS);
+  if (!acquired) {
+    // Throw rather than return the run as-is: the run is still RUNNING, and
+    // handing a non-terminal run back to the client makes it render a summary
+    // flag for an outcome that has not happened yet ("Nothing left to link").
+    // An explicit error is both honest and actionable.
+    console.warn(
+      `[ProjectBucket] commitMigrationRun: run ${params.migrationId} is already being committed elsewhere; refusing to commit twice`
     );
-    await finalizeAfterCommit(run, blockedCount);
-  } else {
-    // At least one item failed to stage (or is still pending). Honour the
-    // transaction rule: keep every native attachment, persist nothing.
-    await migrationRepository.setRunFinal(params.migrationId, 'FAILED', 0, run.requestedCount);
+    throw new Error(
+      'This migration is already being finished in another tab or by the background sweep. ' +
+        'Give it a moment, then reload the issue to see the result.'
+    );
+  }
+
+  try {
+    await commitUnderLease(run, params.actorAccountId);
+  } finally {
+    // Release even on failure: the user's Retry must work immediately rather
+    // than waiting out the lease.
+    await migrationRepository.releaseCommitLease(params.migrationId).catch(() => undefined);
   }
 
   const finalRun = await migrationRepository.getMigrationRun(params.migrationId);
@@ -395,6 +406,36 @@ export async function commitMigrationRun(params: {
     await graphSyncService.republishIssue(finalRun.issueId);
   }
   return finalRun;
+}
+
+// The body of the commit, run with the commit lease held. Split out purely so
+// the lease acquire/release above reads as one thing.
+async function commitUnderLease(run: MigrationRun, actorAccountId: string): Promise<void> {
+  const items = await migrationRepository.getStagedMigrationItems(run.id);
+  const { action, present, blockedCount } = planCommit(items);
+
+  if (action === 'nothing-to-do') {
+    // Every item was withdrawn — sources vanished, files were blocked, or both.
+    // Nothing to do and nothing lost: blocked files are still in Jira. The run
+    // is complete with zero migrations, and failedCount surfaces the blocks.
+    await migrationRepository.setRunFinal(run.id, 'COMPLETED', 0, blockedCount);
+  } else if (action === 'persist') {
+    await persistAndDeleteSession(run, present, actorAccountId, blockedCount);
+  } else if (action === 'retry-deletes') {
+    // Retry of a PARTIAL_FAILURE run: metadata already exists, only the native
+    // deletions need re-attempting. Re-run deletion for the lingering copies.
+    const lingering = items.filter((item) => item.status === 'SOURCE_DELETE_FAILED');
+    await deleteNativeCopiesAndCleanReferences(
+      run.id,
+      run.issueId,
+      lingering.map((item) => ({ item, attachmentId: item.attachmentId! }))
+    );
+    await finalizeAfterCommit(run, blockedCount);
+  } else {
+    // At least one item failed to stage (or is still pending). Honour the
+    // transaction rule: keep every native attachment, persist nothing.
+    await migrationRepository.setRunFinal(run.id, 'FAILED', 0, run.requestedCount);
+  }
 }
 
 // Fresh commit of a fully-staged session: persist every attachment, then
@@ -443,6 +484,10 @@ async function persistAndDeleteSession(
     for (const item of items) {
       const attachmentId = await persistAttachment(run, item, actorAccountId, hierarchy);
       persisted.push({ item, attachmentId });
+      // Heartbeat per item. A large session spends minutes in this loop, and
+      // without this the run looks abandoned to the stale-run detector while
+      // it is in the middle of the one phase that must never be re-entered.
+      await migrationRepository.renewCommitLease(run.id);
     }
   } catch (error) {
     for (const { attachmentId } of persisted) {
@@ -452,7 +497,7 @@ async function persistAndDeleteSession(
     throw error;
   }
 
-  await deleteNativeCopiesAndCleanReferences(run.issueId, persisted);
+  await deleteNativeCopiesAndCleanReferences(run.id, run.issueId, persisted);
   await finalizeAfterCommit(run, blockedCount);
 }
 
@@ -504,6 +549,7 @@ async function persistAttachment(run: MigrationRun, item: StagedItem, actorAccou
 // lingering in Jira, which we surface as SOURCE_DELETE_FAILED + a SYNC_ERROR
 // badge so the user can retry only the deletion.
 async function deleteNativeCopiesAndCleanReferences(
+  migrationId: string,
   issueId: string,
   targets: { item: StagedItem; attachmentId: string }[]
 ): Promise<void> {
@@ -513,8 +559,9 @@ async function deleteNativeCopiesAndCleanReferences(
   const mediaIds = (
     await Promise.all(targets.map(({ item }) => resolveMediaId(item.jiraAttachmentId)))
   ).filter((id): id is string => id !== null);
+  await migrationRepository.renewCommitLease(migrationId);
 
-  const anyDeleted = await deleteNativeCopies(targets);
+  const anyDeleted = await deleteNativeCopies(migrationId, targets);
 
   if (anyDeleted) {
     try {
@@ -529,7 +576,10 @@ async function deleteNativeCopiesAndCleanReferences(
 
 // Returns whether at least one native copy was actually deleted (which is what
 // gates the ADF reference cleanup above).
-async function deleteNativeCopies(targets: { item: StagedItem; attachmentId: string }[]): Promise<boolean> {
+async function deleteNativeCopies(
+  migrationId: string,
+  targets: { item: StagedItem; attachmentId: string }[]
+): Promise<boolean> {
   let anyDeleted = false;
   for (const { item, attachmentId } of targets) {
     try {
@@ -552,6 +602,9 @@ async function deleteNativeCopies(targets: { item: StagedItem; attachmentId: str
       });
       await attachmentRepository.updateSyncStatus(attachmentId, 'SYNC_ERROR');
     }
+    // Heartbeat per deletion, for the same reason as the persist loop above:
+    // one Jira REST round trip per file adds up on a large session.
+    await migrationRepository.renewCommitLease(migrationId);
   }
   return anyDeleted;
 }
@@ -614,6 +667,265 @@ export async function prepareRetry(migrationId: string): Promise<MigrationRun> {
   const refreshed = await migrationRepository.getMigrationRun(migrationId);
   if (!refreshed) throw new Error(`Migration run "${migrationId}" disappeared during retry preparation`);
   return refreshed;
+}
+
+// Stale-run detection threshold: a RUNNING run with no heartbeat for this long
+// is presumed abandoned by whoever was driving it.
+//
+// Sized against the slowest legitimate gap between two heartbeats, which is the
+// stretch inside stageOne between getUploadTarget (writes UPLOADING) and
+// stageMigrationItem (writes STAGED): a full download from Jira, a SHA-256 over
+// the whole blob, thumbnail rendering, and the PUT to storage — for a file up
+// to MAX_FILE_SIZE_BYTES (256 MB), with UPLOAD_CONCURRENCY=3 of them competing
+// for the same connection. Two minutes is comfortably inside that window on an
+// ordinary link, which would make a perfectly healthy run look abandoned and
+// let the very tab running it hijack itself. Ten minutes is past the point
+// where the browser would have given up anyway.
+//
+// The cost of erring long is only that an abandoned run waits longer before a
+// returning user resumes it — and the hourly sweep (sweepAbandonedRuns) is the
+// backstop for the case where nobody ever returns.
+const STALE_RUN_THRESHOLD_MS = 10 * 60 * 1000;
+
+// How long a commit lease is honoured before another commit may steal it. The
+// commit renews it per item, so this only ever elapses if the container running
+// the commit actually died.
+const COMMIT_LEASE_MS = 5 * 60 * 1000;
+
+/**
+ * Atomically claims a RUNNING migration on this issue that has been idle longer
+ * than STALE_RUN_THRESHOLD_MS, resets the items that were in flight when its
+ * browser died back to PENDING, and returns the refreshed run so the calling
+ * browser can resume the pipeline.
+ *
+ * Returns null when there is nothing to recover — no RUNNING run exists, the
+ * existing one is still being actively driven, a commit is in flight against
+ * it, or another poller won the claim. The caller must not show recovery UI in
+ * any of those cases.
+ */
+export async function recoverStaleRun(issueId: string): Promise<MigrationRun | null> {
+  // Claiming is a compare-and-swap that also bumps the heartbeat, so no other
+  // tab (or the sweep) can pick up the same run while this browser resumes it.
+  const staleRun = await migrationRepository.claimStaleRunningRun(issueId, STALE_RUN_THRESHOLD_MS);
+  if (!staleRun) return null;
+
+  console.log(
+    `[ProjectBucket] recoverStaleRun: claimed stale run ${staleRun.id} for issue ${issueId} ` +
+      `with ${staleRun.items.length} item(s)`
+  );
+
+  // Reset the items that were in-flight when the browser died back to PENDING
+  // so the resuming browser re-stages them — see selectResumableItems.
+  const stuckItemIds = selectResumableItems(staleRun.items).map((item) => item.id);
+
+  if (stuckItemIds.length > 0) {
+    await migrationRepository.resetItemsForRetry(staleRun.id, stuckItemIds);
+    await migrationRepository.touchRunActivity(staleRun.id);
+  }
+
+  const refreshed = await migrationRepository.getMigrationRun(staleRun.id);
+  if (!refreshed) throw new Error(`Stale run ${staleRun.id} disappeared during recovery`);
+
+  console.log(
+    `[ProjectBucket] recoverStaleRun: recovered run ${refreshed.id}, ` +
+      `${stuckItemIds.length} item(s) reset to PENDING`
+  );
+  return refreshed;
+}
+
+// ---------------------------------------------------------------------------
+// Abandoned-run sweep — the server-side backstop.
+//
+// recoverStaleRun above only fires while somebody is looking at the issue: the
+// watcher is a jira:issueViewBackgroundScript, so it dies with the issue view.
+// A user who clicks "Link All" and then navigates to a DIFFERENT issue leaves a
+// run that nothing in the browser will ever come back to. Without this sweep
+// that run stays RUNNING forever: the native Jira copies are never deleted, and
+// the staged objects sit in the bucket unreferenced.
+//
+// So this runs hourly and converges those runs without any user present.
+// ---------------------------------------------------------------------------
+
+// Much longer than STALE_RUN_THRESHOLD_MS so the browser-side path always gets
+// first refusal: a user who returns to the issue resumes their own run with the
+// familiar "Resuming…" flag, and only runs nobody came back to reach the sweep.
+const ABANDONED_RUN_THRESHOLD_MS = 30 * 60 * 1000;
+
+// Bounded so one sweep can never run long enough to be killed partway. Anything
+// left over is picked up by the next hourly invocation.
+const ABANDONED_RUN_SWEEP_LIMIT = 25;
+
+export interface AbandonedRunSweepSummary {
+  examined: number;
+  committed: number;
+  aborted: number;
+  objectsReclaimed: number;
+  needsAttention: number;
+}
+
+export type AbandonedRunAction = 'finish' | 'abort-and-reclaim' | 'needs-review';
+
+/**
+ * Decides what the sweep should DO with an abandoned run, with no I/O. Pure for
+ * the same reason planCommit is: 'abort-and-reclaim' DELETES OBJECTS, so a
+ * wrong answer here destroys files that a live attachment row still points at.
+ * See migrationService.test.ts.
+ *
+ *   'finish'            — the remaining work is all backend work (every item is
+ *                         staged, already persisted, or withdrawn), so the
+ *                         sweep can commit the session with no browser present.
+ *   'abort-and-reclaim' — at least one item never got staged and only a browser
+ *                         can move those bytes, AND nothing was ever persisted.
+ *                         Nothing has been deleted from Jira, so the run can be
+ *                         failed and its staged objects reclaimed safely.
+ *   'needs-review'      — the run died PARTWAY THROUGH the irreversible half:
+ *                         some items are already persisted as real attachments
+ *                         while others never staged. Their object keys are
+ *                         referenced by attachment rows, so reclaiming would
+ *                         delete live files. Never guess here.
+ */
+export function planAbandonedRun<T extends { status: MigrationItemStatus }>(
+  items: T[]
+): AbandonedRunAction {
+  const { action } = planCommit(items);
+  if (action !== 'abort') return 'finish';
+
+  const anyPersisted = items.some(
+    (item) => item.status === 'SUCCEEDED' || item.status === 'SOURCE_DELETE_FAILED'
+  );
+  return anyPersisted ? 'needs-review' : 'abort-and-reclaim';
+}
+
+/**
+ * The items a recovered run must re-stage: those that were in flight when the
+ * browser died. Pure so the boundary is testable.
+ *
+ * FAILED is included deliberately — a run that never reached a terminal state
+ * has failures belonging to the interrupted attempt, which deserve one more
+ * try. Items whose work is durably recorded (STAGED, SUCCEEDED,
+ * SOURCE_DELETE_FAILED) and items permanently withdrawn (BLOCKED,
+ * SOURCE_MISSING) are left exactly as they are.
+ */
+export function selectResumableItems<T extends { status: MigrationItemStatus }>(items: T[]): T[] {
+  return items.filter(
+    (item) => item.status === 'PENDING' || item.status === 'UPLOADING' || item.status === 'FAILED'
+  );
+}
+
+export async function sweepAbandonedRuns(): Promise<AbandonedRunSweepSummary> {
+  const runs = await migrationRepository.listStaleRunningRuns(
+    ABANDONED_RUN_THRESHOLD_MS,
+    ABANDONED_RUN_SWEEP_LIMIT
+  );
+  const summary: AbandonedRunSweepSummary = {
+    examined: runs.length,
+    committed: 0,
+    aborted: 0,
+    objectsReclaimed: 0,
+    needsAttention: 0,
+  };
+
+  for (const run of runs) {
+    // Take the same lease a browser commit would, so the sweep can never run
+    // concurrently with a client that woke up at the same moment.
+    const acquired = await migrationRepository.claimCommitLease(run.id, COMMIT_LEASE_MS);
+    if (!acquired) continue;
+
+    try {
+      const items = await migrationRepository.getStagedMigrationItems(run.id);
+
+      if (planAbandonedRun(items) === 'finish') {
+        // Every remaining item is staged (or already persisted, or withdrawn),
+        // and all of that is pure backend work — no browser needed. Finish the
+        // session on the abandoning user's behalf, attributed to whoever
+        // triggered it.
+        console.log(`[ProjectBucket] sweepAbandonedRuns: completing abandoned run ${run.id}`);
+        await commitUnderLease(run, run.triggeredBy);
+        summary.committed += 1;
+      } else {
+        await abortAbandonedRun(run, items, summary);
+      }
+    } catch (error) {
+      console.error(`[ProjectBucket] sweepAbandonedRuns: run ${run.id} failed to converge:`, error);
+    } finally {
+      await migrationRepository.releaseCommitLease(run.id).catch(() => undefined);
+    }
+  }
+
+  return summary;
+}
+
+/**
+ * Handles an abandoned run that CANNOT be finished server-side, because at
+ * least one item never got staged and only a browser can move those bytes.
+ *
+ * Honours the transaction rule exactly as a failed commit does: nothing is
+ * persisted and no native Jira copy is touched, so the user still has every
+ * original attachment. Everything not permanently withdrawn is reset to PENDING
+ * and its staged object deleted, which both reclaims the leaked bytes and
+ * leaves the run cleanly retryable from the start.
+ *
+ * Records what it did into `summary`.
+ */
+async function abortAbandonedRun(
+  run: MigrationRun,
+  items: StagedItem[],
+  summary: AbandonedRunSweepSummary
+): Promise<void> {
+  // Guard against the one case where deleting staged objects would be
+  // destructive: a run that died PARTWAY THROUGH the irreversible half, leaving
+  // some items already persisted as real attachments. Their object keys are now
+  // referenced by attachment rows, so reclaiming them would delete live files.
+  // This needs a human, not a cron job — leave it exactly as-is and say so.
+  if (planAbandonedRun(items) === 'needs-review') {
+    summary.needsAttention += 1;
+    console.warn(
+      `[ProjectBucket] sweepAbandonedRuns: run ${run.id} on issue ${run.issueId} is half-committed ` +
+        `(${items.filter((i) => i.status === 'SUCCEEDED' || i.status === 'SOURCE_DELETE_FAILED').length} ` +
+        `item(s) already persisted, ${items.filter((i) => i.status === 'STAGED').length} still staged). ` +
+        'Leaving it untouched — reclaiming its objects could delete live attachments. Needs manual review.'
+    );
+    return;
+  }
+
+  // Nothing was ever persisted, so every staged object belongs solely to this
+  // aborted attempt and is safe to reclaim.
+  let reclaimed = 0;
+  const stagedKeys = items
+    .filter((item) => item.status === 'STAGED')
+    .map((item) => item.objectKey)
+    .filter((key): key is string => Boolean(key));
+
+  if (stagedKeys.length > 0) {
+    try {
+      const provider = await getStorageProvider({ projectId: run.projectId });
+      for (const key of stagedKeys) {
+        await provider.delete(key);
+        reclaimed += 1;
+      }
+    } catch (error) {
+      // A leaked object costs storage, never correctness. Never let it stop the
+      // run from reaching a terminal state.
+      console.error(`[ProjectBucket] sweepAbandonedRuns: could not reclaim staged objects for ${run.id}:`, error);
+    }
+  }
+
+  // Reset everything that is not permanently withdrawn, so a retry re-stages
+  // from scratch rather than trusting the objects just deleted.
+  const retryableItemIds = items
+    .filter((item) => item.status !== 'SOURCE_MISSING' && item.status !== 'BLOCKED')
+    .map((item) => item.id);
+  await migrationRepository.resetItemsForRetry(run.id, retryableItemIds);
+
+  // Same terminal shape a failed commit produces, so Retry behaves identically.
+  await migrationRepository.setRunFinal(run.id, 'FAILED', 0, run.requestedCount);
+
+  summary.aborted += 1;
+  summary.objectsReclaimed += reclaimed;
+  console.log(
+    `[ProjectBucket] sweepAbandonedRuns: aborted run ${run.id} — nothing migrated, ` +
+      `every native Jira attachment left in place, ${reclaimed} staged object(s) reclaimed`
+  );
 }
 
 export async function listMigrationRunsForIssue(issueId: string): Promise<MigrationRun[]> {

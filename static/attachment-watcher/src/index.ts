@@ -1,5 +1,5 @@
 import { view, showFlag, events, Modal } from '@forge/bridge';
-import { pollPendingSession, dismissSession, beginMigration, runMigration, retryMigration } from './migrationClient';
+import { pollPendingSession, dismissSession, beginMigration, runMigration, retryMigration, recoverStaleMigration } from './migrationClient';
 import { MigrationRun, Session } from './types';
 
 // ---------------------------------------------------------------------------
@@ -60,12 +60,51 @@ interface JiraBackgroundScriptContext {
   };
 }
 
+// Set while this tab is driving a migration — either a fresh "Link All" or a
+// resumed one. The backend's stale-run claim is the real mutual exclusion (it
+// is a compare-and-swap, so two tabs can never both resume the same run), but
+// this stops us from even asking: a run we are actively driving is not stale,
+// and the poll loop keeps ticking every 2 seconds throughout a migration
+// because runMigrationForSession is invoked from a flag's onClick, not from
+// inside pollOnce.
+let migrationInFlight = false;
+
 let polling = false;
 
 async function pollOnce(context: WatcherContext): Promise<void> {
   if (polling) return;
   polling = true;
   try {
+    // RECOVERY CHECK — runs before the new-session check. If a previous
+    // "Link All" was interrupted (the user navigated away, closed the tab,
+    // or the browser crashed mid-migration), the backend will have a RUNNING
+    // migration run whose heartbeat (last_activity_at) has gone stale. We
+    // detect that here and auto-resume it so the customer doesn't have to
+    // do anything — they just see a "Resuming…" flag and the migration
+    // picks up where it left off.
+    //
+    // The backend hands back a run only to the caller that atomically CLAIMS
+    // it, so this is safe to call on every poll and from every open tab.
+    if (!migrationInFlight) {
+      try {
+        const staleRun = await recoverStaleMigration(context.issueId);
+        // Shape guard, not a truthiness guard — for exactly the reason spelled
+        // out on pollPendingSession below: the resolver bridge does not
+        // reliably round-trip `null`, and "nothing to recover" is by far the
+        // common case here. A bare `if (staleRun)` would treat the `{}` that
+        // comes back instead as a real run and blow up on `run.items`.
+        if (staleRun && Array.isArray(staleRun.items) && staleRun.items.length > 0) {
+          console.log(`[ProjectBucket] pollOnce: recovered stale run ${staleRun.id}, auto-resuming...`);
+          await resumeRecoveredRun(context, staleRun);
+          return; // Recovery handled this cycle; skip the new-session check.
+        }
+      } catch (recoveryError) {
+        // Recovery is best-effort: a failure here must never block the normal
+        // new-session detection path. Log it and fall through.
+        console.error('[ProjectBucket] Stale-run recovery check failed:', recoveryError);
+      }
+    }
+
     const session = await pollPendingSession(context.issueId);
     // Guard on items being a non-empty array, not just session being truthy.
     // The Forge resolver bridge does not reliably round-trip a `null` return
@@ -117,6 +156,7 @@ async function presentDetectionPopup(context: WatcherContext, session: Session):
 
 async function runMigrationForSession(context: WatcherContext, session: Session): Promise<void> {
   console.log('[ProjectBucket] runMigrationForSession: starting, session.id =', session.id, 'items =', session.items.length);
+  migrationInFlight = true;
   try {
     const run = await beginMigration({
       issueId: context.issueId,
@@ -138,6 +178,59 @@ async function runMigrationForSession(context: WatcherContext, session: Session)
       description: error instanceof Error ? error.message : String(error),
       isAutoDismiss: false,
     });
+  } finally {
+    migrationInFlight = false;
+  }
+}
+
+// Resumes a migration run that was interrupted when the previous browser tab
+// died. Shows a non-dismissible "Resuming…" flag during the migration so
+// the customer knows something is happening, then presents the normal
+// outcome summary when it completes.
+//
+// skipMissingSources is deliberately NOT set. The first attempt's contract is
+// that a vanished source fails the whole session, so the user is told nothing
+// moved before anything gets silently skipped — and a resumed run may well BE
+// that first attempt, one whose outcome the user never saw. Retry is where the
+// user opts into leniency, having read the failure; resuming must not make that
+// choice on their behalf. See migrationClient.RunMigrationOptions.
+async function resumeRecoveredRun(context: WatcherContext, run: MigrationRun): Promise<void> {
+  migrationInFlight = true;
+  const count = run.items.filter((item) => item.status === 'PENDING').length;
+  // A recovered run with nothing PENDING is one whose upload phase finished but
+  // whose COMMIT was interrupted — there is nothing left to re-upload, only the
+  // session to finish. Saying "resuming 0 attachments" would be nonsense.
+  const description =
+    count === 0
+      ? 'A previous Link All was interrupted just before it finished. Completing it now…'
+      : `A previous Link All was interrupted. Resuming ${count} remaining ${
+          count === 1 ? 'attachment' : 'attachments'
+        }…`;
+  const resumeFlag = await showFlag({
+    id: `pb-resuming-${run.id}`,
+    title: 'Resuming migration…',
+    type: 'info',
+    description,
+    isAutoDismiss: false,
+  });
+
+  try {
+    const finished = await runMigration(run);
+    resumeFlag.close();
+    await presentSummaryFlag(context, finished);
+    await maybeRefreshIssueView(finished);
+  } catch (error) {
+    resumeFlag.close();
+    console.error('[ProjectBucket] resumeRecoveredRun: CAUGHT ERROR:', error);
+    showFlag({
+      id: `pb-resume-error-${run.id}`,
+      title: 'Resuming migration failed',
+      type: 'error',
+      description: error instanceof Error ? error.message : String(error),
+      isAutoDismiss: false,
+    });
+  } finally {
+    migrationInFlight = false;
   }
 }
 
@@ -185,6 +278,10 @@ async function presentSummaryFlag(context: WatcherContext, run: MigrationRun): P
   const retryAction = {
     text: 'Retry',
     onClick: async () => {
+      // Same reason as runMigrationForSession: the poll loop keeps ticking
+      // while this runs, and a run we are driving must not be offered up for
+      // recovery.
+      migrationInFlight = true;
       try {
         // Close the current summary flag before showing the retry result,
         // otherwise the old flag and the new one would stack.
@@ -212,6 +309,8 @@ async function presentSummaryFlag(context: WatcherContext, run: MigrationRun): P
           description: error instanceof Error ? error.message : String(error),
           isAutoDismiss: false,
         });
+      } finally {
+        migrationInFlight = false;
       }
     },
   };

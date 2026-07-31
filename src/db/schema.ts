@@ -221,6 +221,32 @@ const MIGRATION_ITEM_THUMBNAIL_COLUMNS: { name: string; addColumnDdl: string }[]
 ];
 const V014_MIGRATION_NAME = 'v014_add_migration_items_thumbnail';
 
+// Tracks the last time any item in this run changed state. Used to detect
+// browser-abandoned runs: if a RUNNING run's last_activity_at is older than
+// the stale threshold, whoever detects it may claim the run, reset its stuck
+// items and resume the pipeline. Set to started_at when the run is created;
+// bumped on every item state transition AND throughout the commit phase, so
+// "no heartbeat" really does mean "nobody is driving this run".
+const MIGRATION_RUNS_LAST_ACTIVITY_COLUMNS: { name: string; addColumnDdl: string }[] = [
+  { name: 'last_activity_at', addColumnDdl: 'ALTER TABLE migration_runs ADD COLUMN last_activity_at DATETIME NULL' },
+];
+const V016_MIGRATION_NAME = 'v016_add_migration_runs_last_activity';
+
+// Commit lease. The commit phase is the irreversible half of the migration
+// (persist metadata, then delete native Jira copies), and it is NOT safe to
+// run twice concurrently: two overlapping commits each see every item as
+// STAGED and each insert a full set of attachment rows, duplicating every
+// file in the session. This column is the mutual-exclusion token — a commit
+// may only proceed if it wins an atomic compare-and-swap on it (see
+// migrationRepository.claimCommitLease). NULL means no commit is in flight.
+//
+// It is a timestamp rather than a boolean so a lease held by a container that
+// died can expire and be re-claimed, instead of wedging the run forever.
+const MIGRATION_RUNS_COMMIT_LEASE_COLUMNS: { name: string; addColumnDdl: string }[] = [
+  { name: 'commit_started_at', addColumnDdl: 'ALTER TABLE migration_runs ADD COLUMN commit_started_at DATETIME NULL' },
+];
+const V018_MIGRATION_NAME = 'v018_add_migration_runs_commit_lease';
+
 // One-time repair. Office documents carry a preview image inside the container
 // that only the authoring application refreshes, so files produced by a script
 // or an export tool ship their template's BLANK placeholder. An earlier build
@@ -340,5 +366,7 @@ export async function applySchemaMigrations(): Promise<void> {
   await reconcileAddedColumns(V012_MIGRATION_NAME, 'attachments', ATTACHMENTS_THUMBNAIL_COLUMNS);
   await reconcileAddedColumns(V013_MIGRATION_NAME, 'attachments', ATTACHMENTS_STORAGE_KEY_COLUMNS);
   await reconcileAddedColumns(V014_MIGRATION_NAME, 'migration_items', MIGRATION_ITEM_THUMBNAIL_COLUMNS);
+  await reconcileAddedColumns(V016_MIGRATION_NAME, 'migration_runs', MIGRATION_RUNS_LAST_ACTIVITY_COLUMNS);
+  await reconcileAddedColumns(V018_MIGRATION_NAME, 'migration_runs', MIGRATION_RUNS_COMMIT_LEASE_COLUMNS);
   await resetOfficeThumbnailStatus();
 }

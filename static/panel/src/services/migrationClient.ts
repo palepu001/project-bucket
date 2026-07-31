@@ -16,6 +16,34 @@ function callResolver<T>(functionKey: string, payload?: Record<string, unknown>)
 
 const UPLOAD_CONCURRENCY = 3;
 
+// A thumbnail is best-effort decoration; the migration it is attached to is a
+// transaction. Nothing downstream of generateThumbnail is allowed to decide
+// whether a session commits, so the wait for one is bounded here rather than in
+// any individual renderer. Without this bound a renderer that neither resolves
+// nor rejects — pdf.js falling back to a blob: worker that never initialises is
+// the observed case — parks stageOne forever, and because runWithConcurrency
+// joins on Promise.all, that one item silently strands the entire session:
+// no commit, no failure, no flag, and a run left RUNNING in the database.
+// Timing out rejects, which the existing catch turns into a FAILED thumbnail,
+// so the file still migrates and only its preview is missing.
+const THUMBNAIL_TIMEOUT_MS = 30_000;
+
+function withThumbnailTimeout(promise: Promise<ThumbnailResult>): Promise<ThumbnailResult> {
+  return new Promise<ThumbnailResult>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('Thumbnail generation timed out')), THUMBNAIL_TIMEOUT_MS);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
+}
+
 // Hashing has to materialize the WHOLE blob as an ArrayBuffer, which doubles
 // that file's memory for the duration. With UPLOAD_CONCURRENCY items in flight
 // and a 256 MB ceiling per file, letting those overlap is how the tab runs out
@@ -113,7 +141,20 @@ async function stageOne(run: MigrationRun, item: MigrationItem, skipMissingSourc
 
     let thumbnailKey: string | null = null;
     let thumbnailStatus: ThumbnailResult['status'] = null;
-    const thumbnailResult = await thumbnailPromise.catch((): ThumbnailResult => ({ blob: null, status: 'FAILED' }));
+    const thumbnailResult = await withThumbnailTimeout(thumbnailPromise).catch((thumbError): ThumbnailResult => {
+      // Named explicitly: a thumbnail failure never fails the file, so without
+      // a line here the only symptom is a missing preview with no stated cause.
+      console.warn(`[ProjectBucket] thumbnail generation failed for "${item.filename}":`, thumbError);
+      // generateThumbnail() never itself rejects — it has its own internal
+      // try/catch that always resolves to a verdict, including FAILED. So the
+      // only way this .catch() can fire is the timeout above, which means the
+      // renderer hung rather than ran and lost — see THUMBNAIL_TIMEOUT_MS. That
+      // is a fact about THIS environment, not about these bytes, so it must NOT
+      // be recorded as FAILED: FAILED is a permanent verdict the gallery's
+      // backfill never reconsiders. A null status is what makes the panel retry
+      // the render on first view instead of leaving the icon stuck forever.
+      return { blob: null, status: null };
+    });
     thumbnailStatus = thumbnailResult.status;
 
     if (thumbnailResult.blob) {
@@ -200,4 +241,13 @@ export async function dismissSession(sessionId: string): Promise<void> {
 
 export async function pollPendingSession(issueId: string): Promise<Session | null> {
   return callResolver<Session | null>('pollPendingSession', { issueId });
+}
+
+/**
+ * Asks the backend whether a stale RUNNING migration exists for this issue.
+ * Returns the recovered run (with stuck items reset to PENDING) if one was
+ * found, or null if there is nothing to resume.
+ */
+export async function recoverStaleMigration(issueId: string): Promise<MigrationRun | null> {
+  return callResolver<MigrationRun | null>('recoverStaleMigration', { issueId });
 }

@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto';
 import { sql } from '@forge/sql';
 import { ensureSchema } from '../db/client';
-import { nowSqlDateTime, sqlDateTimeToIso } from '../db/time';
+import { nowSqlDateTime, sqlDateTimeToIso, toSqlDateTime } from '../db/time';
 import { MigrationItem, MigrationItemStatus, MigrationRun, MigrationRunStatus } from '../types/migration';
 import { AttachmentThumbnailStatus } from '../types/attachment';
 
@@ -17,6 +17,8 @@ interface MigrationRunRow {
   started_at: string;
   completed_at: string | null;
   triggered_by: string;
+  last_activity_at: string | null;
+  commit_started_at: string | null;
 }
 
 interface MigrationItemRow {
@@ -112,10 +114,10 @@ export async function createMigrationRun(params: CreateMigrationRunParams): Prom
   await sql
     .prepare(
       `INSERT INTO migration_runs
-        (id, issue_id, project_id, session_id, requested_count, migrated_count, failed_count, status, started_at, triggered_by)
-       VALUES (?, ?, ?, ?, ?, 0, 0, 'RUNNING', ?, ?)`
+        (id, issue_id, project_id, session_id, requested_count, migrated_count, failed_count, status, started_at, triggered_by, last_activity_at)
+       VALUES (?, ?, ?, ?, ?, 0, 0, 'RUNNING', ?, ?, ?)`
     )
-    .bindParams(id, params.issueId, params.projectId, params.sessionId, params.items.length, now, params.triggeredBy)
+    .bindParams(id, params.issueId, params.projectId, params.sessionId, params.items.length, now, params.triggeredBy, now)
     .execute();
 
   for (const item of params.items) {
@@ -260,11 +262,15 @@ export async function setRunFinal(
   failedCount: number
 ): Promise<void> {
   await ensureSchema();
+  // Clearing commit_started_at here as well as in the commit's own `finally`
+  // keeps a terminal run from ever carrying a stale lease: a run that is no
+  // longer RUNNING can never be recovered anyway, but leaving the token set
+  // would block the retry that reopenRun sets up.
   await sql
     .prepare(
-      'UPDATE migration_runs SET status = ?, migrated_count = ?, failed_count = ?, completed_at = ? WHERE id = ?'
+      'UPDATE migration_runs SET status = ?, migrated_count = ?, failed_count = ?, completed_at = ?, last_activity_at = ?, commit_started_at = NULL WHERE id = ?'
     )
-    .bindParams(status, migratedCount, failedCount, nowSqlDateTime(), migrationId)
+    .bindParams(status, migratedCount, failedCount, nowSqlDateTime(), nowSqlDateTime(), migrationId)
     .execute();
 }
 
@@ -285,11 +291,190 @@ export async function resetItemsForRetry(migrationId: string, itemIds: string[])
     .execute();
 }
 
-/** Re-opens a terminal run (FAILED or PARTIAL_FAILURE) so its commit can be retried. */
+/**
+ * Re-opens a terminal run (FAILED or PARTIAL_FAILURE) so its commit can be retried.
+ *
+ * Resets `last_activity_at` to now as part of the same statement. This is not
+ * bookkeeping — it is load-bearing. The run's last heartbeat is by definition
+ * old (it was written during the attempt that failed, before the user read the
+ * error and decided to retry), so a run re-opened without it is born already
+ * past the staleness threshold: the very next poll would "recover" the retry
+ * out from under itself, reset the items being re-staged, and start a second
+ * concurrent pipeline.
+ */
 export async function reopenRun(migrationId: string): Promise<void> {
   await ensureSchema();
   await sql
-    .prepare("UPDATE migration_runs SET status = 'RUNNING', completed_at = NULL WHERE id = ?")
+    .prepare(
+      "UPDATE migration_runs SET status = 'RUNNING', completed_at = NULL, last_activity_at = ?, commit_started_at = NULL WHERE id = ?"
+    )
+    .bindParams(nowSqlDateTime(), migrationId)
+    .execute();
+}
+
+/**
+ * Atomically CLAIMS a RUNNING migration run for the given issue that has been
+ * idle longer than `staleThresholdMs` — i.e. one whose browser died mid-run.
+ *
+ * The claim is a compare-and-swap, exactly like sessionRepository's
+ * claimQuietSession: the candidate is selected, then a conditional UPDATE
+ * re-checks the staleness predicate and bumps the heartbeat in one statement.
+ * Only the caller whose UPDATE actually changes a row (affectedRows === 1)
+ * gets the run back; everyone else gets null. Without that, two tabs polling
+ * the same issue both read the same stale row and both start resuming it,
+ * which is how a session gets migrated twice.
+ *
+ * A run is stale when its `last_activity_at` is older than the threshold AND
+ * no commit is in flight against it (`commit_started_at`). The commit phase
+ * heartbeats too, but it is checked separately so that a bug in one signal
+ * cannot on its own re-open the duplicate-commit path. If `last_activity_at`
+ * is NULL (runs created before the column existed), falls back to `started_at`.
+ */
+export async function claimStaleRunningRun(
+  issueId: string,
+  staleThresholdMs: number
+): Promise<MigrationRun | null> {
+  await ensureSchema();
+  // Any RUNNING run whose last activity (or start time, for runs predating the
+  // column) is before this instant is considered abandoned by its browser.
+  const cutoffStr = toSqlDateTime(new Date(Date.now() - staleThresholdMs));
+
+  const candidate = await sql
+    .prepare(
+      `SELECT id FROM migration_runs
+       WHERE issue_id = ? AND status = 'RUNNING'
+         AND COALESCE(last_activity_at, started_at) < ?
+         AND (commit_started_at IS NULL OR commit_started_at < ?)
+       ORDER BY started_at DESC
+       LIMIT 1`
+    )
+    .bindParams(issueId, cutoffStr, cutoffStr)
+    .execute();
+
+  const candidateRows = candidate.rows as unknown as { id: string }[];
+  if (candidateRows.length === 0) return null;
+  const runId = candidateRows[0].id;
+
+  // Re-assert the whole predicate inside the UPDATE. Between the SELECT above
+  // and this statement another poller may have claimed the run, or the browser
+  // that owns it may have come back to life and heartbeated.
+  const claim = await sql
+    .prepare(
+      `UPDATE migration_runs SET last_activity_at = ?
+       WHERE id = ? AND status = 'RUNNING'
+         AND COALESCE(last_activity_at, started_at) < ?
+         AND (commit_started_at IS NULL OR commit_started_at < ?)`
+    )
+    .bindParams(nowSqlDateTime(), runId, cutoffStr, cutoffStr)
+    .execute();
+
+  const affectedRows = (claim.rows as unknown as { affectedRows: number }).affectedRows;
+  if (affectedRows !== 1) return null;
+
+  return getMigrationRun(runId);
+}
+
+/**
+ * Lists RUNNING runs across ALL issues that have been idle longer than
+ * `staleThresholdMs`. Used only by the hourly abandoned-run sweep, which is
+ * the backstop for runs whose user never returned to the issue (the
+ * browser-side recovery above only fires while someone is looking at it).
+ */
+export async function listStaleRunningRuns(
+  staleThresholdMs: number,
+  limit: number
+): Promise<MigrationRun[]> {
+  await ensureSchema();
+  const cutoffStr = toSqlDateTime(new Date(Date.now() - staleThresholdMs));
+  // Interpolated rather than bound: a placeholder in LIMIT is not portable
+  // across every prepared-statement path, and the elsewhere-in-this-file
+  // convention is a literal (see listMigrationRuns' LIMIT 50). Coerced to a
+  // positive integer so it can never carry anything but a number.
+  const safeLimit = Math.max(1, Math.floor(limit));
+
+  const result = await sql
+    .prepare(
+      `SELECT * FROM migration_runs
+       WHERE status = 'RUNNING'
+         AND COALESCE(last_activity_at, started_at) < ?
+         AND (commit_started_at IS NULL OR commit_started_at < ?)
+       ORDER BY started_at ASC
+       LIMIT ${safeLimit}`
+    )
+    .bindParams(cutoffStr, cutoffStr)
+    .execute();
+
+  const rows = result.rows as unknown as MigrationRunRow[];
+  const runs: MigrationRun[] = [];
+  for (const row of rows) {
+    runs.push(toMigrationRun(row, await fetchItems(row.id)));
+  }
+  return runs;
+}
+
+/**
+ * Bumps the `last_activity_at` timestamp on a migration run to "now". Called
+ * whenever an item changes state and periodically during the commit phase, so
+ * the stale-run detector can tell whether anyone is still driving this run.
+ */
+export async function touchRunActivity(migrationId: string): Promise<void> {
+  await ensureSchema();
+  await sql
+    .prepare('UPDATE migration_runs SET last_activity_at = ? WHERE id = ?')
+    .bindParams(nowSqlDateTime(), migrationId)
+    .execute();
+}
+
+/**
+ * Attempts to take the commit lease on a run — the mutual exclusion that makes
+ * commitMigrationRun safe to call concurrently. Returns true only for the
+ * caller that wins; every other caller gets false and must not commit.
+ *
+ * This is what prevents the duplicate-attachment failure mode: two commits
+ * racing on the same run each observe every item as STAGED, each run
+ * planCommit → 'persist', and each insert a full set of attachment rows for
+ * the same files while both delete the native Jira copies.
+ *
+ * An existing lease older than `leaseMs` is stolen, on the assumption its
+ * holder's container died — otherwise a crashed commit would wedge the run
+ * permanently. Live commits renew the lease (see renewCommitLease), so a
+ * genuinely slow commit is never mistaken for a dead one.
+ */
+export async function claimCommitLease(migrationId: string, leaseMs: number): Promise<boolean> {
+  await ensureSchema();
+  const now = nowSqlDateTime();
+  const expiryStr = toSqlDateTime(new Date(Date.now() - leaseMs));
+
+  const claim = await sql
+    .prepare(
+      `UPDATE migration_runs SET commit_started_at = ?, last_activity_at = ?
+       WHERE id = ? AND (commit_started_at IS NULL OR commit_started_at < ?)`
+    )
+    .bindParams(now, now, migrationId, expiryStr)
+    .execute();
+
+  return (claim.rows as unknown as { affectedRows: number }).affectedRows === 1;
+}
+
+/** Extends a held commit lease and heartbeats the run. Called as the commit progresses. */
+export async function renewCommitLease(migrationId: string): Promise<void> {
+  await ensureSchema();
+  const now = nowSqlDateTime();
+  await sql
+    .prepare('UPDATE migration_runs SET commit_started_at = ?, last_activity_at = ? WHERE id = ?')
+    .bindParams(now, now, migrationId)
+    .execute();
+}
+
+/**
+ * Releases the commit lease. Always called in a `finally`, so a commit that
+ * throws does not hold the lease until it expires — the user's Retry should
+ * work immediately, not two lease-lengths later.
+ */
+export async function releaseCommitLease(migrationId: string): Promise<void> {
+  await ensureSchema();
+  await sql
+    .prepare('UPDATE migration_runs SET commit_started_at = NULL WHERE id = ?')
     .bindParams(migrationId)
     .execute();
 }

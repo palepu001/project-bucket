@@ -726,6 +726,20 @@ resolver.define('getMigrationDiagnostics', async (req) => {
   return migrationService.listMigrationRunsForIssue(issueId);
 });
 
+// Invoked by the attachment watcher on every issue view. Atomically CLAIMS a
+// stale RUNNING migration the caller should auto-resume, or returns null if
+// there is nothing to recover. The claim is a compare-and-swap, so calling this
+// on every poll cycle and from every open tab is safe — only one caller can
+// ever win a given run.
+resolver.define('recoverStaleMigration', async (req) => {
+  const { issueId } = req.payload as { issueId: string };
+  if (!issueId) throw new Error('recoverStaleMigration requires an issueId');
+  // Claiming a run mutates it (items are reset to PENDING), so it is gated on
+  // an authenticated user like every other mutating step of the pipeline.
+  requireAccountId(req.context);
+  return migrationService.recoverStaleRun(issueId);
+});
+
 resolver.define('resolveIssueContext', async (req) => {
   const { issueIdOrKey } = req.payload as { issueIdOrKey: string };
   if (!issueIdOrKey) throw new Error('resolveIssueContext requires issueIdOrKey');

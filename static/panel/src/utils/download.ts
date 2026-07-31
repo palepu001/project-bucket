@@ -24,3 +24,22 @@ export function triggerBrowserDownload(url: string, filename: string): void {
   link.click();
   document.body.removeChild(link);
 }
+
+/**
+ * Downloads a same-origin `blob:` URL — used by "Download all", whose ZIP is
+ * assembled in the browser rather than fetched from storage.
+ *
+ * Unlike triggerBrowserDownload above, this does NOT set target="_blank": a
+ * blob: URL is same-origin to this iframe, so the `download` attribute is
+ * honoured and the click saves the file directly. Opening a new tab would just
+ * flash an empty context. The caller owns revoking the object URL afterwards.
+ */
+export function triggerBlobDownload(url: string, filename: string): void {
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  link.rel = 'noopener noreferrer';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+}

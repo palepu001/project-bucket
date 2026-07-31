@@ -130,6 +130,14 @@ body {
   border-bottom-color: var(--pb-blue);
 }
 
+/* Nudge the headline action up a few pixels so it reads as sitting slightly
+   above the tab baseline rather than centred on it — a lighter, less "boxed in"
+   look. Transform (not margin) so the row's height and the tab rule are
+   untouched. */
+.pb-topbar-upload {
+  transform: translateY(-4px);
+}
+
 .pb-toolbar {
   display: flex;
   flex-direction: column;
@@ -137,11 +145,95 @@ body {
   margin-bottom: 16px;
 }
 
+/* Search + the "⋯" overflow menu share one row; search takes the slack. */
+.pb-toolbar-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .pb-search {
   padding: 6px 10px;
   border: 1px solid var(--pb-gray-200);
   border-radius: 3px;
   font-size: 13px;
+}
+
+.pb-toolbar-row .pb-search {
+  flex: 1;
+  min-width: 0;
+}
+
+/* ── Overflow ("⋯") menu ────────────────────────────────────────────────── */
+.pb-menu {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.pb-menu-trigger {
+  width: 32px;
+  height: 32px;
+  background: transparent;
+  border: 1px solid var(--pb-gray-200);
+  box-shadow: none;
+  color: var(--pb-gray-500);
+}
+
+.pb-menu-trigger:hover {
+  background: var(--pb-gray-50);
+  color: var(--pb-gray-900);
+}
+
+.pb-menu-list {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 50;
+  min-width: 190px;
+  background: white;
+  border: 1px solid var(--pb-gray-200);
+  border-radius: 4px;
+  box-shadow: 0 4px 12px rgba(9, 30, 66, 0.25);
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+}
+
+.pb-menu-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  border-radius: 3px;
+  padding: 8px 10px;
+  font-size: 13px;
+  color: var(--pb-gray-900);
+  cursor: pointer;
+}
+
+.pb-menu-item:hover:not(:disabled) {
+  background: var(--pb-gray-50);
+}
+
+.pb-menu-item:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.pb-menu-item-danger {
+  color: var(--pb-red);
+}
+
+.pb-menu-count {
+  font-size: 11px;
+  color: var(--pb-gray-500);
+  background: var(--pb-gray-50);
+  border-radius: 10px;
+  padding: 1px 8px;
 }
 
 .pb-filters {
@@ -731,4 +823,220 @@ body {
 
 .pb-storage-audit-status-error {
   background: #ffebe6;
+}
+
+/* ── List view ──────────────────────────────────────────────────────────────
+   The Name / Size / Date-added table from Jira's native attachments list. The
+   header and every row share one grid template so columns line up; per-row
+   actions reveal on hover/focus like the grid cards do. */
+.pb-list {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--pb-gray-200);
+  border-radius: 3px;
+  overflow: hidden;
+  background: white;
+}
+
+.pb-list-head,
+.pb-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 90px 160px 64px;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+}
+
+.pb-list-head {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--pb-gray-500);
+  background: var(--pb-gray-50);
+  border-bottom: 1px solid var(--pb-gray-200);
+}
+
+.pb-row {
+  border-top: 1px solid var(--pb-gray-200);
+  position: relative;
+}
+
+.pb-list-head + .pb-row,
+.pb-row:first-child {
+  border-top: none;
+}
+
+.pb-row:hover {
+  background: var(--pb-gray-50);
+}
+
+.pb-row-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.pb-list-head .pb-row-name {
+  cursor: default;
+}
+
+.pb-row-thumb {
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border-radius: 3px;
+  background: var(--pb-gray-50);
+}
+
+.pb-row-thumb img {
+  width: 24px;
+  height: 24px;
+  object-fit: cover;
+  object-position: center top;
+}
+
+.pb-row-thumb svg {
+  width: 20px;
+  height: 24px;
+}
+
+.pb-row-filename {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+.pb-row-size,
+.pb-row-date {
+  font-size: 12px;
+  color: var(--pb-gray-500);
+}
+
+.pb-row-warning {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #ff8b00;
+  color: white;
+  font-size: 11px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: help;
+}
+
+.pb-row-actions {
+  display: flex;
+  gap: 4px;
+  justify-content: flex-end;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.1s ease;
+}
+
+.pb-row:hover .pb-row-actions,
+.pb-row:focus-within .pb-row-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* ── Upload progress (grid + list placeholders) ─────────────────────────────
+   The one place the panel paints transfer progress; downloads defer to the
+   browser's own UI. An in-flight upload sits among the real attachments right
+   where its finished card/row will appear. */
+.pb-progress {
+  width: 100%;
+  height: 6px;
+  background: var(--pb-gray-200);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.pb-progress-fill {
+  height: 100%;
+  background: var(--pb-blue);
+  border-radius: 999px;
+  transition: width 0.15s ease;
+}
+
+.pb-progress-failed .pb-progress-fill {
+  background: var(--pb-red);
+}
+
+/* Bytes not yet moving: a looping sliver instead of a stuck 0%. */
+.pb-progress-indeterminate {
+  width: 40%;
+  animation: pb-indeterminate 1.1s ease-in-out infinite;
+}
+
+@keyframes pb-indeterminate {
+  0% {
+    margin-left: -40%;
+  }
+  100% {
+    margin-left: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pb-progress-indeterminate {
+    animation: none;
+    width: 100%;
+  }
+}
+
+.pb-card-uploading .pb-card-preview-uploading {
+  flex-direction: column;
+  padding: 12px;
+  gap: 8px;
+  cursor: default;
+}
+
+.pb-upload-meta {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: center;
+}
+
+.pb-upload-status {
+  font-size: 11px;
+  color: var(--pb-gray-500);
+  text-align: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.pb-card-failed .pb-upload-status,
+.pb-row-failed .pb-upload-status {
+  color: var(--pb-red);
+}
+
+/* In list view the uploading row shows name + size, then the bar fills the
+   remaining columns where date + actions would sit. */
+.pb-row-upload {
+  grid-column: 3 / -1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.pb-row-upload .pb-progress {
+  flex: 1;
+}
+
+.pb-row-upload .pb-upload-status {
+  flex-shrink: 0;
 }

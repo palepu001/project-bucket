@@ -1,64 +1,17 @@
-import { useRef, useState } from 'react';
-import { showFlag } from '@forge/bridge';
-import { uploadFiles } from '../services/uploadService';
-import { Attachment } from '../types';
+import { useRef } from 'react';
 
+// A thin file picker. All upload orchestration — validation, transfer, progress
+// placeholders, flags and the gallery refresh — lives in App.handleUpload so the
+// in-progress state can be surfaced as optimistic cards/rows in the gallery.
+// This component only opens the OS picker and hands the chosen files up.
 export function UploadButton({
-  issueId,
-  projectId,
-  onUploaded,
+  onFiles,
+  busy,
 }: {
-  issueId: string;
-  projectId: string;
-  onUploaded: (created: Attachment[]) => void;
+  onFiles: (files: File[]) => void;
+  busy: boolean;
 })  {
   const inputRef = useRef<HTMLInputElement>(null);
-  const [busy, setBusy] = useState(false);
-
-  async function handleFiles(fileList: FileList | null) {
-    if (!fileList || fileList.length === 0) return;
-    const files = Array.from(fileList);
-    setBusy(true);
-    try {
-      const { created, failed } = await uploadFiles(files, issueId, projectId);
-      if (created.length > 0) {
-        onUploaded(created);
-      }
-      if (failed.length > 0) {
-        showFlag({
-          id: `pb-upload-failed-${Date.now()}`,
-          title: failed.length === 1 ? 'A file failed to upload' : `${failed.length} files failed to upload`,
-          type: 'error',
-          description: failed.map((f) => `${f.filename}: ${f.error}`).join('; '),
-          isAutoDismiss: false,
-        });
-      } else if (created.length > 0) {
-        showFlag({
-          id: `pb-upload-success-${Date.now()}`,
-          title: created.length === 1 ? 'Attachment added' : `${created.length} attachments added`,
-          type: 'success',
-          description: 'Uploaded to Project Bucket.',
-          isAutoDismiss: true,
-        });
-      }
-    } catch (error) {
-      let errorMessage = error instanceof Error ? error.message : String(error);
-      if (errorMessage.includes('<!DOCTYPE html>') || errorMessage.includes('<html')) {
-        errorMessage = 'A network or proxy error occurred while communicating with the server. If you are using forge tunnel, this may be an issue with tunnel connectivity.';
-      }
-      
-      showFlag({
-        id: `pb-upload-error-${Date.now()}`,
-        title: 'Upload failed',
-        type: 'error',
-        description: errorMessage,
-        isAutoDismiss: false,
-      });
-    } finally {
-      setBusy(false);
-      if (inputRef.current) inputRef.current.value = '';
-    }
-  }
 
   return (
     <>
@@ -67,7 +20,7 @@ export function UploadButton({
           ADS onboarding treatment, so it grabs attention while still reading
           as native Jira; it stops on hover/focus (see styles.css). */}
       <button
-        className="pb-button pb-button-primary pb-button-pulse"
+        className="pb-button pb-button-primary pb-button-pulse pb-topbar-upload"
         disabled={busy}
         onClick={() => inputRef.current?.click()}
       >
@@ -78,7 +31,13 @@ export function UploadButton({
         type="file"
         multiple
         style={{ display: 'none' }}
-        onChange={(event) => handleFiles(event.target.files)}
+        onChange={(event) => {
+          const files = event.target.files ? Array.from(event.target.files) : [];
+          // Reset the input BEFORE handing off, so picking the same file again
+          // later still fires onChange (the value would otherwise be unchanged).
+          if (inputRef.current) inputRef.current.value = '';
+          if (files.length > 0) onFiles(files);
+        }}
       />
     </>
   );
