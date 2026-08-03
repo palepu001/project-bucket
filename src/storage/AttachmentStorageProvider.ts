@@ -110,6 +110,14 @@ export interface AttachmentStorageProvider {
   /** Read the raw bytes at `ref`. Returns null if nothing is stored there. */
   stream(ref: string): Promise<ByteStream | null>;
 
+  /**
+   * Read at most the first `length` bytes at `ref`. Used for server-side
+   * content signature validation after browser-direct uploads: the backend
+   * never needs the full object to decide whether the claimed extension and
+   * stored bytes agree.
+   */
+  readHeaderBytes(ref: string, length: number): Promise<Uint8Array | null>;
+
   /** Permanently remove `ref`. Idempotent — removing a missing ref is not an error. */
   delete(ref: string): Promise<void>;
 

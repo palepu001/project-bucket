@@ -8,6 +8,19 @@ import {
 import { createHash } from 'crypto';
 import { StorageCredentials } from './storageConfigService';
 
+const DEFAULT_FORGE_CUSTOM_UI_ORIGINS = ['https://*.cdn.prod.atlassian-dev.net'];
+
+function allowedCorsOrigins(): string[] {
+  const configured = process.env.PROJECT_BUCKET_CUSTOM_UI_ORIGINS;
+  if (!configured) return DEFAULT_FORGE_CUSTOM_UI_ORIGINS;
+
+  const origins = configured
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter((origin) => origin.length > 0);
+  return origins.length > 0 ? origins : DEFAULT_FORGE_CUSTOM_UI_ORIGINS;
+}
+
 function generateShortHash(input: string): string {
   return createHash('sha256').update(input).digest('hex').substring(0, 8);
 }
@@ -76,7 +89,7 @@ export async function provisionBucket(bucketName: string, creds: StorageCredenti
           {
             AllowedHeaders: ['*'],
             AllowedMethods: ['PUT', 'GET', 'HEAD'],
-            AllowedOrigins: ['*'],
+            AllowedOrigins: allowedCorsOrigins(),
             ExposeHeaders: ['ETag', 'x-amz-checksum-sha256'],
             MaxAgeSeconds: 3000,
           },

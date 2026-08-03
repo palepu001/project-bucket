@@ -69,6 +69,101 @@ function putObjectWithProgress(
   });
 }
 
+// All targets for a batch are minted together (one round trip — see the
+// FLOW comment below) but PUT out serially, so a file queued behind several
+// large ones can sit for longer than the presigned URL's short expiry
+// before its own turn comes up. Rather than widen the expiry for everyone,
+// recognize S3's "the request has expired" 403 and re-mint just that one
+// file's target, on demand, for a single retry.
+function isExpiredUrlError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return message.startsWith('HTTP 403') && /expired/i.test(message);
+}
+
+async function remintUploadTarget(
+  filename: string,
+  size: number,
+  mimeType: string,
+  checksum: string,
+  issueId: string,
+  projectId: string
+): Promise<any> {
+  const [result] = await api.invokeResolver<any>('uploadObjects', {
+    objects: [{ filename, size, mimeType, checksum }],
+    issueId,
+    projectId,
+  });
+  return result;
+}
+
+async function uploadMainFile(
+  file: File,
+  target: any,
+  checksum: string,
+  issueId: string,
+  projectId: string,
+  onProgress: (loaded: number) => void
+): Promise<{ ok: true; key: string } | { ok: false; error: string }> {
+  try {
+    await putObjectWithProgress(file, target, onProgress);
+    return { ok: true, key: target.key };
+  } catch (err: any) {
+    if (!isExpiredUrlError(err)) {
+      return { ok: false, error: err.message || 'Network error uploading to storage backend' };
+    }
+  }
+
+  const fresh = await remintUploadTarget(file.name, file.size, file.type || 'application/octet-stream', checksum, issueId, projectId);
+  if (!fresh?.success) {
+    return { ok: false, error: fresh?.message || 'Backend validation rejected the payload' };
+  }
+  try {
+    await putObjectWithProgress(file, fresh, onProgress);
+    return { ok: true, key: fresh.key };
+  } catch (err: any) {
+    return { ok: false, error: err.message || 'Network error uploading to storage backend' };
+  }
+}
+
+async function putObject(body: Blob, result: any): Promise<boolean> {
+  if (!result || !result.success) return false;
+  const response = await fetch(result.url, {
+    method: result.method || 'PUT',
+    body,
+    headers: result.headers || {},
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`HTTP ${response.status}: ${text}`);
+  }
+  return true;
+}
+
+async function uploadThumbnailBlob(
+  blob: Blob,
+  target: any,
+  filename: string,
+  checksum: string,
+  issueId: string,
+  projectId: string
+): Promise<{ ok: true; key: string } | { ok: false }> {
+  try {
+    if (await putObject(blob, target)) return { ok: true, key: target.key };
+    return { ok: false };
+  } catch (err) {
+    if (!isExpiredUrlError(err)) return { ok: false };
+  }
+
+  const fresh = await remintUploadTarget(filename, blob.size, 'image/jpeg', checksum, issueId, projectId);
+  if (!fresh?.success) return { ok: false };
+  try {
+    if (await putObject(blob, fresh)) return { ok: true, key: fresh.key };
+    return { ok: false };
+  } catch {
+    return { ok: false };
+  }
+}
+
 // The validation pipeline is created once and reused across all uploads —
 // validators are stateless, so a single instance is safe for the lifetime
 // of the panel. This avoids re-constructing the validator chain on every
@@ -186,20 +281,6 @@ export async function uploadFiles(
 
   const results = await api.invokeResolver<any>('uploadObjects', { objects: payloadObjects, issueId, projectId });
 
-  async function putObject(body: Blob, result: any): Promise<boolean> {
-    if (!result || !result.success) return false;
-    const response = await fetch(result.url, { 
-      method: result.method || 'PUT', 
-      body, 
-      headers: result.headers || {} 
-    });
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`HTTP ${response.status}: ${text}`);
-    }
-    return true;
-  }
-
   const succeeded: {
     file: File;
     key: string;
@@ -227,22 +308,20 @@ export async function uploadFiles(
 
     entry.phase = 'uploading';
     emit();
-    try {
-      await putObjectWithProgress(file, result, (loaded) => {
-        entry.loaded = loaded;
-        emit();
-      });
-      entry.loaded = file.size;
-      entry.phase = 'saving';
+    const uploadResult = await uploadMainFile(file, result, checksums[i], issueId, projectId, (loaded) => {
+      entry.loaded = loaded;
       emit();
-    } catch (err: any) {
-      const message = err.message || 'Network error uploading to storage backend';
-      failed.push({ filename: file.name, error: message });
+    });
+    if (!uploadResult.ok) {
+      failed.push({ filename: file.name, error: uploadResult.error });
       entry.phase = 'failed';
-      entry.error = message;
+      entry.error = uploadResult.error;
       emit();
       continue;
     }
+    entry.loaded = file.size;
+    entry.phase = 'saving';
+    emit();
 
     // The thumbnail is uploaded after its file so a thumbnail-only failure can
     // never cost us the attachment — we just record it as FAILED and move on.
@@ -253,18 +332,22 @@ export async function uploadFiles(
     let thumbnailStatus = thumbnails[i].status;
     const slot = thumbnailSlotOf.get(i);
     if (slot !== undefined) {
-      try {
-        if (await putObject(thumbnails[i].blob!, results[slot])) {
-          thumbnailKey = results[slot].key;
-        } else {
-          thumbnailStatus = 'FAILED';
-        }
-      } catch (err) {
+      const thumbResult = await uploadThumbnailBlob(
+        thumbnails[i].blob!,
+        results[slot],
+        thumbnailFilenameFor(file.name),
+        checksums[slot],
+        issueId,
+        projectId
+      );
+      if (thumbResult.ok) {
+        thumbnailKey = thumbResult.key;
+      } else {
         thumbnailStatus = 'FAILED';
       }
     }
 
-    succeeded.push({ file, key: result.key, checksum: checksums[i], thumbnailKey, thumbnailStatus });
+    succeeded.push({ file, key: uploadResult.key, checksum: checksums[i], thumbnailKey, thumbnailStatus });
   }
 
   if (succeeded.length === 0) {

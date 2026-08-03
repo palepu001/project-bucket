@@ -11,8 +11,9 @@ import { ValidationResult } from './types';
 // existed the migration path got none of them, so a file Jira accepted went
 // straight to the storage location unexamined. Migrated content is the least
 // trusted input the app handles, so it now runs the same checks:
-//   1. stateless — filename, extension whitelist, MIME denylist, size
-//   2. signature — magic bytes must match the claimed extension
+//   1. stateless — filename, extension blocklist, MIME denylist, size
+//   2. signature — dangerous magic detection (catches executables regardless
+//      of extension) + format integrity for known types
 //
 // Malware scanning is deliberately NOT run here. The only scanner wired up
 // today is MockScanner (always passes), so including it would add a round of
@@ -34,3 +35,4 @@ export async function validateMigratedBlob(
   // from the blob rather than duplicating the magic-number table.
   return signatureValidator.validate(new File([blob], normalizedName, { type: mimeType }));
 }
+

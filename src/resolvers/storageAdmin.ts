@@ -79,8 +79,16 @@ resolver.define('saveCredentials', async (req) => {
 
   if (projectId) {
     await setProjectCredentials(projectId, creds);
+    const bucketStatus = await getProjectBucketStatus(projectId);
+    if (bucketStatus?.status === 'PROVISIONED') {
+      await provisionBucket(bucketStatus.name, creds);
+    }
   } else {
     await setInstanceCredentials(creds);
+    const bucketStatus = await getInstanceBucketStatus();
+    if (bucketStatus?.status === 'PROVISIONED') {
+      await provisionBucket(bucketStatus.name, creds);
+    }
   }
 
   // A rotated key must take effect now, not whenever the cached provider

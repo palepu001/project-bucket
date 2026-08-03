@@ -48,7 +48,7 @@ export class FilenameValidator implements PayloadValidator {
 
 /**
  * Validates the file extension to prevent uploads of unapproved file types.
- * Replaces the weak blocklist with a strict ALLOWED_EXTENSIONS whitelist.
+ * Enforces a strict ALLOWED_EXTENSIONS whitelist.
  */
 export class WhitelistValidator implements PayloadValidator {
   readonly name = 'WhitelistValidator';
@@ -63,17 +63,8 @@ export class WhitelistValidator implements PayloadValidator {
 
     const segments = filename.split('.');
     if (segments.length > 2) { 
-      for (let i = 1; i < segments.length; i++) {
+      for (let i = 1; i < segments.length - 1; i++) {
         const segment = segments[i].toLowerCase();
-        // If an inner segment is a known dangerous extension (meaning it's NOT in the whitelist, and it matches something risky, 
-        // wait, we can't block just anything not in the whitelist because 'v1' is not in the whitelist.
-        // We only want to block double extensions if they disguise a known dangerous type.
-        // But since we use a whitelist, if someone uploads report.exe.pdf, the final extension is .pdf (allowed).
-        // Is .exe allowed? No. Should we block ANY inner extension that is not in the whitelist? No, because 'v1' or 'backup' are not in the whitelist.
-        // We should block inner segments that look like executables.
-        // Since we removed the BLOCKED list, we can just hardcode a small list of highly dangerous inner extensions
-        // or we can rely on the final extension.
-        // Let's hardcode the most dangerous ones for the double extension check.
         if (['exe', 'bat', 'cmd', 'sh', 'js', 'vbs', 'msi', 'jar', 'scr', 'dll'].includes(segment)) {
           return { passed: false, code: 'FORBIDDEN_EXTENSION', message: 'The file appears to disguise a blocked extension.', validator: this.name };
         }
@@ -137,3 +128,4 @@ export function validateStateless(payload: FilePayload): ValidationResult {
   }
   return { passed: true };
 }
+

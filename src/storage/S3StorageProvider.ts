@@ -19,6 +19,31 @@ import { mapSettledWithConcurrency } from '../util/concurrency';
 import { ObjectNotFoundError } from './ObjectNotFoundError';
 import { StorageCredentials } from '../services/storageConfigService';
 
+const PRESIGNED_URL_EXPIRY_SECONDS = 300;
+
+async function bodyToBuffer(body: unknown): Promise<Buffer> {
+  const anyBody = body as any;
+  if (!anyBody) return Buffer.alloc(0);
+  if (typeof anyBody.transformToByteArray === 'function') {
+    return Buffer.from(await anyBody.transformToByteArray());
+  }
+  if (typeof anyBody.getReader === 'function') {
+    const reader = anyBody.getReader();
+    const chunks: Uint8Array[] = [];
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+    return Buffer.concat(chunks);
+  }
+  const chunks: Uint8Array[] = [];
+  for await (const chunk of anyBody as AsyncIterable<Uint8Array | Buffer | string>) {
+    chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
 /**
  * Builds a Content-Disposition value that survives non-ASCII filenames.
  * RFC 6266: `filename` carries an ASCII-only fallback for old clients and
@@ -69,7 +94,7 @@ export class S3StorageProvider implements AttachmentStorageProvider {
     // unhoisted (a real signed header) so the client sends the same header
     // that was signed, and S3 records a checksum exists() can verify later.
     const url = await getSignedUrl(this.s3, command, {
-      expiresIn: 3600,
+      expiresIn: PRESIGNED_URL_EXPIRY_SECONDS,
       unhoistableHeaders: new Set(['x-amz-checksum-sha256']),
     });
 
@@ -104,7 +129,7 @@ export class S3StorageProvider implements AttachmentStorageProvider {
         ? { ResponseContentDisposition: contentDispositionFor(options.downloadFilename) }
         : {}),
     });
-    const url = await getSignedUrl(this.s3, command, { expiresIn: 3600 });
+    const url = await getSignedUrl(this.s3, command, { expiresIn: PRESIGNED_URL_EXPIRY_SECONDS });
     return { url };
   }
 
@@ -115,6 +140,26 @@ export class S3StorageProvider implements AttachmentStorageProvider {
 
       const body = response.Body as unknown as ReadableStream<Uint8Array>;
       return { body, size: response.ContentLength || 0 };
+    } catch (error: any) {
+      if (error.name === 'NotFound' || error.$metadata?.httpStatusCode === 404 || error.name === 'NoSuchKey') {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  async readHeaderBytes(ref: string, length: number): Promise<Uint8Array | null> {
+    if (length <= 0) return new Uint8Array();
+    try {
+      const response = await this.s3.send(
+        new GetObjectCommand({
+          Bucket: this.bucket,
+          Key: ref,
+          Range: `bytes=0-${length - 1}`,
+        })
+      );
+      if (!response.Body) return null;
+      return new Uint8Array(await bodyToBuffer(response.Body));
     } catch (error: any) {
       if (error.name === 'NotFound' || error.$metadata?.httpStatusCode === 404 || error.name === 'NoSuchKey') {
         return null;

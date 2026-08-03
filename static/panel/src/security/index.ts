@@ -9,7 +9,7 @@ import { MockScanner } from './scanners/mockScanner';
 
 export function createDefaultPipeline(): ValidationPipeline {
   return new ValidationPipeline([
-    // 1. Shared stateless validations (Filename, Whitelist, MIME, Size)
+    // 1. Shared stateless validations (Filename, Blocklist, MIME, Size)
     new StatelessPipelineAdapter(),
     
     // 2. Client-only stateful validations

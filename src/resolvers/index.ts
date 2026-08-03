@@ -14,6 +14,8 @@ import * as migrationService from '../services/migrationService';
 import { getIssueHierarchy } from '../services/jiraIssueHierarchy';
 import * as graphSyncService from '../services/graphSyncService';
 import * as storageConsistencyService from '../services/storageConsistencyService';
+import { verifyIssueAccess } from '../services/jiraIssueAccessService';
+import { assertStoredObjectMatchesFilename } from '../services/contentSignatureService';
 
 const resolver = new Resolver();
 
@@ -22,13 +24,6 @@ function requireAccountId(context: { accountId?: string | null }): string {
     throw new Error('This action requires an authenticated user.');
   }
   return context.accountId;
-}
-
-async function verifyIssueAccess(issueId: string): Promise<void> {
-  const response = await api.asUser().requestJira(route`/rest/api/3/issue/${issueId}?fields=id`);
-  if (!response.ok) {
-    throw new Error(`Unauthorized or missing issue ${issueId}`);
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -357,6 +352,7 @@ resolver.define('uploadObjects', async (req) => {
   if (!issueId || !projectId) {
     throw new Error('uploadObjects requires issueId and projectId');
   }
+  await verifyIssueAccess(issueId);
   
   // Cached — a migration session calls this once per item for that item's
   // thumbnail, all for the same issue. See services/jiraIssueHierarchy.ts.
@@ -434,6 +430,7 @@ resolver.define('recordAttachments', async (req) => {
     throw new Error('recordAttachments requires issueId, projectId, and at least one item');
   }
   const uploadedBy = requireAccountId(req.context);
+  await verifyIssueAccess(issueId);
 
   // Verify every object actually landed in the store before trusting it —
   // the browser reported "success", but this is the last line of defense
@@ -482,6 +479,7 @@ resolver.define('recordAttachments', async (req) => {
     if (!nameCheck.passed) {
       throw new Error(`"${item.filename}" cannot be recorded — ${nameCheck.message}`);
     }
+    await assertStoredObjectMatchesFilename(provider, item.key, filename);
     const attachment = {
       id: randomUUID(),
       issueId,
@@ -624,6 +622,7 @@ resolver.define('beginMigration', async (req) => {
     throw new Error('beginMigration requires issueId, projectId, and at least one item');
   }
   const triggeredBy = requireAccountId(req.context);
+  await verifyIssueAccess(issueId);
   console.log(`[ProjectBucket] beginMigration: issueId=${issueId} projectId=${projectId} items=${items.length} files=[${items.map(i => i.filename).join(', ')}]`);
   const run = await migrationService.beginMigration({ issueId, projectId, sessionId: sessionId ?? null, triggeredBy, items });
   console.log(`[ProjectBucket] beginMigration: created run ${run.id} with ${run.items.length} item(s)`);
@@ -691,6 +690,7 @@ resolver.define('blockMigrationItem', async (req) => {
 
 resolver.define('failMigrationItem', async (req) => {
   const { migrationId, itemId, error } = req.payload as { migrationId: string; itemId: string; error: string };
+  requireAccountId(req.context);
   await migrationService.failMigrationItem({ migrationId, itemId, error });
   return { success: true };
 });
@@ -717,6 +717,7 @@ resolver.define('commitMigrationRun', async (req) => {
 
 resolver.define('retryMigration', async (req) => {
   const { migrationId } = req.payload as { migrationId: string };
+  requireAccountId(req.context);
   return migrationService.prepareRetry(migrationId);
 });
 

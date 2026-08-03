@@ -111,3 +111,26 @@ test('Pipeline rejects .exe file via the default pipeline', async () => {
   const result = await pipeline.run(file);
   assert.equal(result.passed, false);
 });
+
+test('Pipeline allows .exr file with clean bytes', async () => {
+  const pipeline = createDefaultPipeline();
+  // Random bytes that are not dangerous.
+  const file = new File([new Uint8Array([0x76, 0x2F, 0x31, 0x01, 0x02, 0x00, 0x00, 0x00])], 'render.exr', {
+    type: 'application/octet-stream',
+  });
+  const result = await pipeline.run(file);
+  assert.equal(result.passed, true);
+});
+
+test('Pipeline blocks .exr file with MZ header bytes (dangerous content)', async () => {
+  const pipeline = createDefaultPipeline();
+  // MZ header — Windows executable disguised as .exr
+  const file = new File([new Uint8Array([0x4D, 0x5A, 0x90, 0x00, 0x03, 0x00])], 'render.exr', {
+    type: 'application/octet-stream',
+  });
+  const result = await pipeline.run(file);
+  assert.equal(result.passed, false);
+  if (!result.passed) {
+    assert.equal(result.code, 'DANGEROUS_CONTENT');
+  }
+});

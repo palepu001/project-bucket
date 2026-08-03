@@ -6,13 +6,15 @@ import * as attachmentRepository from '../repositories/attachmentRepository';
 import { deleteNativeAttachment, getAttachmentMetadata } from './jiraAttachmentSource';
 import * as graphSyncService from './graphSyncService';
 import { resolveMediaId, removeMediaReferences } from './jiraContentCleanup';
-import { getStorageProvider, ChecksumType } from '../storage';
+import { getStorageProvider, ChecksumType, ExistenceResult } from '../storage';
 import { generateStorageKey, StorageKeyContext } from '../util/storageKey';
 import { FileNormalizer } from '../shared/security/normalizer';
 import { validateStateless } from '../shared/security/validators/statelessPipeline';
 import { getIssueHierarchy } from './jiraIssueHierarchy';
 import { AttachmentThumbnailStatus, extensionOf } from '../types/attachment';
 import { MigrationItemStatus, MigrationRun } from '../types/migration';
+import { verifyIssueAccess } from './jiraIssueAccessService';
+import { assertStoredObjectMatchesFilename } from './contentSignatureService';
 
 // Orchestrates the Jira-native → Project Bucket migration of ONE upload
 // session as a single transaction. The unit of work is the whole session, not
@@ -58,6 +60,7 @@ export async function beginMigration(params: {
   triggeredBy: string;
   items: { jiraAttachmentId: string; filename: string }[];
 }): Promise<MigrationRun> {
+  await verifyIssueAccess(params.issueId);
   const run = await migrationRepository.createMigrationRun(params);
   if (params.sessionId) {
     await sessionRepository.markSessionResolved(params.sessionId);
@@ -76,6 +79,7 @@ export async function getUploadTarget(params: {
 }): Promise<{ objectKey: string; uploadUrl: string; method?: string; headers?: Record<string, string> }> {
   const run = await migrationRepository.getMigrationRun(params.migrationId);
   if (!run) throw new Error('Migration run not found');
+  await verifyIssueAccess(run.issueId);
 
   // Same trust boundary the "Add Attachment" path enforces in the uploadObjects
   // resolver. Minting a transfer target IS the moment bytes are allowed to
@@ -147,6 +151,10 @@ export async function stageMigrationItem(params: {
 }): Promise<{ staged: true }> {
   const run = await migrationRepository.getMigrationRun(params.migrationId);
   if (!run) throw new Error('Migration run not found');
+  await verifyIssueAccess(run.issueId);
+  const item = run.items.find((candidate) => candidate.id === params.itemId);
+  if (!item) throw new Error(`Migration item "${params.itemId}" not found in run "${params.migrationId}"`);
+
   const provider = await getStorageProvider({ projectId: run.projectId });
   const [check] = await provider.exists([params.objectKey]);
   if (check?.status === 'error') {
@@ -163,6 +171,15 @@ export async function stageMigrationItem(params: {
       completedAt: true,
     });
     throw new Error(message);
+  }
+
+  try {
+    await assertStoredObjectMatchesFilename(provider, params.objectKey, item.filename);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    await blockItem(params.itemId, item.filename, reason);
+    await migrationRepository.touchRunActivity(params.migrationId);
+    throw error;
   }
 
   await migrationRepository.updateMigrationItem(params.itemId, {
@@ -210,6 +227,10 @@ export async function blockMigrationItem(params: {
   itemId: string;
   reason: string;
 }): Promise<{ blocked: true }> {
+  const run = await migrationRepository.getMigrationRun(params.migrationId);
+  if (!run) throw new Error(`Migration run "${params.migrationId}" not found`);
+  await verifyIssueAccess(run.issueId);
+
   const items = await migrationRepository.getStagedMigrationItems(params.migrationId);
   const item = items.find((candidate) => candidate.id === params.itemId);
   if (!item) throw new Error(`Migration item "${params.itemId}" not found`);
@@ -238,6 +259,10 @@ export async function failMigrationItem(params: {
   itemId: string;
   error: string;
 }): Promise<void> {
+  const run = await migrationRepository.getMigrationRun(params.migrationId);
+  if (!run) throw new Error(`Migration run "${params.migrationId}" not found`);
+  await verifyIssueAccess(run.issueId);
+
   const items = await migrationRepository.getStagedMigrationItems(params.migrationId);
   const item = items.find((candidate) => candidate.id === params.itemId);
   if (
@@ -275,6 +300,10 @@ export async function skipMissingMigrationItem(params: {
   migrationId: string;
   itemId: string;
 }): Promise<{ skipped: boolean }> {
+  const run = await migrationRepository.getMigrationRun(params.migrationId);
+  if (!run) throw new Error(`Migration run "${params.migrationId}" not found`);
+  await verifyIssueAccess(run.issueId);
+
   const items = await migrationRepository.getStagedMigrationItems(params.migrationId);
   const item = items.find((candidate) => candidate.id === params.itemId);
   if (!item) throw new Error(`Migration item "${params.itemId}" not found`);
@@ -312,6 +341,31 @@ export interface CommitPlan<T extends { status: MigrationItemStatus }> {
   /** The items still inside the transaction — withdrawn ones removed. */
   present: T[];
   blockedCount: number;
+}
+
+/**
+ * Identifies items whose Project Bucket copy is not safe enough to justify
+ * deleting the native Jira attachment.
+ *
+ * Pure and exported for the same reason planCommit is: this is a deletion
+ * gate. If it says an item is safe when it is not, migration can delete the
+ * user's native copy while the Project Bucket copy is missing or corrupt.
+ */
+export function selectUnsafeNativeDeleteTargets<T extends { objectKey: string | null; size: number | null }>(
+  items: T[],
+  checks: ExistenceResult[]
+): T[] {
+  const foundByRef = new Map(
+    checks
+      .filter((check) => check.status === 'found' && check.summary)
+      .map((check) => [check.ref, check.summary!])
+  );
+
+  return items.filter((item) => {
+    if (!item.objectKey || item.size === null) return true;
+    const summary = foundByRef.get(item.objectKey);
+    return !summary || summary.size !== item.size;
+  });
 }
 
 /**
@@ -368,6 +422,7 @@ export async function commitMigrationRun(params: {
 }): Promise<MigrationRun> {
   const run = await migrationRepository.getMigrationRun(params.migrationId);
   if (!run) throw new Error(`Migration run "${params.migrationId}" not found`);
+  await verifyIssueAccess(run.issueId);
 
   // Mutual exclusion, not an optimisation. Two commits racing on the same run
   // each see every item as STAGED, each plan 'persist', and each insert a full
@@ -477,6 +532,16 @@ async function persistAndDeleteSession(
     );
   }
 
+  for (const item of items) {
+    if (!item.objectKey) continue;
+    try {
+      await assertStoredObjectMatchesFilename(provider, item.objectKey, item.filename);
+    } catch (error) {
+      await migrationRepository.setRunFinal(run.id, 'FAILED', 0, run.requestedCount);
+      throw error;
+    }
+  }
+
   const hierarchy = await getIssueHierarchy(run.issueId);
 
   const persisted: { item: StagedItem; attachmentId: string }[] = [];
@@ -489,9 +554,19 @@ async function persistAndDeleteSession(
       // it is in the middle of the one phase that must never be re-entered.
       await migrationRepository.renewCommitLease(run.id);
     }
+    await assertNativeDeleteTargetsAreSafe(run, items);
   } catch (error) {
     for (const { attachmentId } of persisted) {
       await attachmentRepository.deleteAttachmentRow(attachmentId).catch(() => undefined);
+    }
+    for (const { item } of persisted) {
+      await migrationRepository.updateMigrationItem(item.id, {
+        status: 'FAILED',
+        attachmentId: null,
+        errorMessage:
+          'Migration aborted before deleting the Jira attachment because the Project Bucket copy could not be re-verified. Retry will re-stage this file.',
+        completedAt: true,
+      }).catch(() => undefined);
     }
     await migrationRepository.setRunFinal(run.id, 'FAILED', 0, run.requestedCount);
     throw error;
@@ -499,6 +574,29 @@ async function persistAndDeleteSession(
 
   await deleteNativeCopiesAndCleanReferences(run.id, run.issueId, persisted);
   await finalizeAfterCommit(run, blockedCount);
+}
+
+async function assertNativeDeleteTargetsAreSafe(run: MigrationRun, items: StagedItem[]): Promise<void> {
+  const objectKeys = items
+    .map((item) => item.objectKey)
+    .filter((key): key is string => Boolean(key));
+  const provider = await getStorageProvider({ projectId: run.projectId });
+  const checks = await provider.exists(objectKeys);
+
+  if (checks.some((check) => check.status === 'error')) {
+    throw new Error(
+      'Native Jira attachments were not deleted because Project Bucket could not re-verify every copied file.'
+    );
+  }
+
+  const unsafe = selectUnsafeNativeDeleteTargets(items, checks);
+  if (unsafe.length > 0) {
+    throw new Error(
+      `Native Jira attachments were not deleted because ${unsafe.length} Project Bucket ` +
+        `cop${unsafe.length === 1 ? 'y is' : 'ies are'} missing or size-mismatched: ` +
+        unsafe.map((item) => item.filename).join(', ')
+    );
+  }
 }
 
 async function persistAttachment(run: MigrationRun, item: StagedItem, actorAccountId: string, hierarchy: { projectKey: string, issueKey: string, epicKey: string | null }): Promise<string> {
@@ -642,6 +740,7 @@ async function finalizeAfterCommit(run: MigrationRun, blockedCount = 0): Promise
 export async function prepareRetry(migrationId: string): Promise<MigrationRun> {
   const run = await migrationRepository.getMigrationRun(migrationId);
   if (!run) throw new Error(`Migration run "${migrationId}" not found`);
+  await verifyIssueAccess(run.issueId);
 
   if (run.status === 'FAILED') {
     // Re-stage everything that is not already successfully staged. Besides the
@@ -704,6 +803,7 @@ const COMMIT_LEASE_MS = 5 * 60 * 1000;
  * any of those cases.
  */
 export async function recoverStaleRun(issueId: string): Promise<MigrationRun | null> {
+  await verifyIssueAccess(issueId);
   // Claiming is a compare-and-swap that also bumps the heartbeat, so no other
   // tab (or the sweep) can pick up the same run while this browser resumes it.
   const staleRun = await migrationRepository.claimStaleRunningRun(issueId, STALE_RUN_THRESHOLD_MS);

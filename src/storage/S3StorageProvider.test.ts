@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { S3Client, HeadObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, GetObjectCommand, HeadObjectCommand } from '@aws-sdk/client-s3';
 import { contentDispositionFor, S3StorageProvider } from './S3StorageProvider';
 
 const DUMMY_CREDS = {
@@ -95,6 +95,19 @@ test('upload() signs the checksum as a real header instead of hoisting it into t
     'checksum must not be hoisted into the query string once it is unhoistable'
   );
   assert.equal(target.headers?.['x-amz-checksum-sha256'], 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdead=');
+  assert.equal(url.searchParams.get('X-Amz-Expires'), '300');
+});
+
+test('download() URLs expire after five minutes', async (t) => {
+  t.mock.method(S3Client.prototype, 'send', async (command: unknown) => {
+    assert.ok(command instanceof HeadObjectCommand);
+    return {};
+  });
+
+  const provider = new S3StorageProvider(DUMMY_CREDS, 'test-bucket');
+  const target = await provider.download('some/key.pdf');
+  const url = new URL(target.url);
+  assert.equal(url.searchParams.get('X-Amz-Expires'), '300');
 });
 
 // Regression coverage: HeadObject silently omits ChecksumSHA256 from its
@@ -114,4 +127,17 @@ test('exists() requests ChecksumMode ENABLED so HeadObject returns the stored ch
   assert.equal(send.mock.callCount(), 1);
   assert.equal(result.status, 'found');
   assert.equal(result.summary?.checksum, 'abc=');
+});
+
+test('readHeaderBytes() performs a bounded range read', async (t) => {
+  const provider = new S3StorageProvider(DUMMY_CREDS, 'test-bucket');
+  const send = t.mock.method(S3Client.prototype, 'send', async (command: unknown) => {
+    assert.ok(command instanceof GetObjectCommand);
+    assert.equal(command.input.Range, 'bytes=0-7');
+    return { Body: { transformToByteArray: async () => new Uint8Array([0x25, 0x50, 0x44, 0x46]) } };
+  });
+
+  const bytes = await provider.readHeaderBytes('some/key.pdf', 8);
+  assert.equal(send.mock.callCount(), 1);
+  assert.deepEqual(Array.from(bytes ?? []), [0x25, 0x50, 0x44, 0x46]);
 });

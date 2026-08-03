@@ -1,6 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { planAbandonedRun, planCommit, selectResumableItems } from './migrationService';
+import {
+  planAbandonedRun,
+  planCommit,
+  selectResumableItems,
+  selectUnsafeNativeDeleteTargets,
+} from './migrationService';
 import { MigrationItemStatus } from '../types/migration';
 
 // Coverage for the migration transaction rule. This is the decision that says
@@ -89,6 +94,31 @@ test('an empty run aborts rather than reporting a successful no-op', () => {
   // Distinct from "everything was withdrawn": an empty item list means the run
   // is malformed, and must not read as a completed migration.
   assert.equal(planCommit([]).action, 'abort');
+});
+
+test('native delete safety gate accepts only stored copies with matching size', () => {
+  const migrationItems = [
+    { objectKey: 'a', size: 10, filename: 'a.pdf' },
+    { objectKey: 'b', size: 20, filename: 'b.pdf' },
+  ];
+  const unsafe = selectUnsafeNativeDeleteTargets(migrationItems, [
+    { ref: 'a', status: 'found', summary: { ref: 'a', size: 10, checksum: 'ok' } },
+    { ref: 'b', status: 'found', summary: { ref: 'b', size: 20, checksum: 'ok' } },
+  ]);
+  assert.deepEqual(unsafe, []);
+});
+
+test('native delete safety gate blocks missing and size-mismatched copies', () => {
+  const migrationItems = [
+    { objectKey: 'a', size: 10, filename: 'a.pdf' },
+    { objectKey: 'b', size: 20, filename: 'b.pdf' },
+    { objectKey: null, size: 30, filename: 'c.pdf' },
+  ];
+  const unsafe = selectUnsafeNativeDeleteTargets(migrationItems, [
+    { ref: 'a', status: 'found', summary: { ref: 'a', size: 9, checksum: 'wrong-size' } },
+    { ref: 'b', status: 'missing' },
+  ]);
+  assert.deepEqual(unsafe.map((item) => item.filename), ['a.pdf', 'b.pdf', 'c.pdf']);
 });
 
 // ---------------------------------------------------------------------------
