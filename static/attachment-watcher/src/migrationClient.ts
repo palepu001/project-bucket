@@ -269,3 +269,7 @@ export async function migrateSessionOnBackend(params: {
 }): Promise<MigrationRun> {
   return callResolver<MigrationRun>('migrateSessionOnBackend', params);
 }
+
+export async function forceRecoverSessionMigration(sessionId: string): Promise<MigrationRun | null> {
+  return callResolver<MigrationRun | null>('forceRecoverSessionMigration', { sessionId });
+}

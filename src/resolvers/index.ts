@@ -776,4 +776,11 @@ resolver.define('migrateSessionOnBackend', async (req) => {
   });
 });
 
+resolver.define('forceRecoverSessionMigration', async (req) => {
+  const { sessionId } = req.payload as { sessionId: string };
+  if (!sessionId) throw new Error('forceRecoverSessionMigration requires a sessionId');
+  requireAccountId(req.context);
+  return migrationService.forceRecoverSessionMigration(sessionId);
+});
+
 export const handler = resolver.getDefinitions();

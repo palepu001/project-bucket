@@ -1,5 +1,5 @@
 import { view, showFlag, events, Modal } from '@forge/bridge';
-import { pollPendingSession, dismissSession, runMigration, retryMigration, recoverStaleMigration, migrateSessionOnBackend } from './migrationClient';
+import { pollPendingSession, dismissSession, runMigration, retryMigration, recoverStaleMigration, migrateSessionOnBackend, forceRecoverSessionMigration } from './migrationClient';
 import { MigrationRun, Session } from './types';
 
 // ---------------------------------------------------------------------------
@@ -167,7 +167,18 @@ async function runMigrationForSession(context: WatcherContext, session: Session)
     await presentSummaryFlag(context, finished);
     await maybeRefreshIssueView(finished);
   } catch (error) {
-    console.error('[ProjectBucket] runMigrationForSession: CAUGHT ERROR:', error);
+    console.error('[ProjectBucket] runMigrationForSession backend attempt failed, checking fallback:', error);
+    try {
+      const run = await forceRecoverSessionMigration(session.id);
+      if (run && Array.isArray(run.items) && run.items.length > 0) {
+        console.log('[ProjectBucket] runMigrationForSession: backend failed (e.g. timeout), falling back to browser-driven migration', run.id);
+        await resumeRecoveredRun(context, run);
+        return;
+      }
+    } catch (fallbackError) {
+      console.error('[ProjectBucket] runMigrationForSession fallback recovery failed:', fallbackError);
+    }
+
     showFlag({
       id: `pb-migration-error-${session.id}`,
       title: 'Linking to Project Bucket failed',

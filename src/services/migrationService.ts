@@ -1190,3 +1190,16 @@ export async function migrateSessionOnBackend(params: {
   if (!finalRun) throw new Error(`Migration run "${run.id}" not found after execution`);
   return finalRun;
 }
+
+export async function forceRecoverSessionMigration(sessionId: string): Promise<MigrationRun | null> {
+  const run = await migrationRepository.getActiveRunForSession(sessionId);
+  if (!run) return null;
+  await verifyIssueAccess(run.issueId);
+
+  const stuckItemIds = selectResumableItems(run.items).map((item) => item.id);
+  if (stuckItemIds.length > 0) {
+    await migrationRepository.resetItemsForRetry(run.id, stuckItemIds);
+    await migrationRepository.touchRunActivity(run.id);
+  }
+  return migrationRepository.getMigrationRun(run.id);
+}

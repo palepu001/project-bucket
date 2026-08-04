@@ -143,6 +143,17 @@ export async function getMigrationRun(migrationId: string): Promise<MigrationRun
   return toMigrationRun(rows[0], await fetchItems(migrationId));
 }
 
+export async function getActiveRunForSession(sessionId: string): Promise<MigrationRun | null> {
+  await ensureSchema();
+  const result = await sql
+    .prepare("SELECT * FROM migration_runs WHERE session_id = ? AND status = 'RUNNING' LIMIT 1")
+    .bindParams(sessionId)
+    .execute();
+  const rows = result.rows as unknown as MigrationRunRow[];
+  if (rows.length === 0) return null;
+  return toMigrationRun(rows[0], await fetchItems(rows[0].id));
+}
+
 export async function listMigrationRuns(issueId: string): Promise<MigrationRun[]> {
   await ensureSchema();
   const result = await sql
