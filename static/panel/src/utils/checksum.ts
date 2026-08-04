@@ -1,16 +1,23 @@
-// SHA-256 checksum, base64-encoded, computed entirely in-browser via the
-// Web Crypto API. This is what storage backend's presigned-upload
-// contract requires (see storage/AttachmentStorageProvider.ts on the
-// backend) — the checksum must be known BEFORE the presigned URL is minted,
-// so it always has to be computed client-side before the upload resolver is
-// ever called.
+import { sha256 } from 'js-sha256';
+
+// SHA-256 checksum, base64-encoded, computed entirely in-browser.
+// Read and digested chunk-by-chunk to prevent Out Of Memory (OOM) crashes on large files.
 export async function sha256Base64(blob: Blob): Promise<string> {
-  const buffer = await blob.arrayBuffer();
-  const digest = await crypto.subtle.digest('SHA-256', buffer);
-  const bytes = new Uint8Array(digest);
+  const hash = sha256.create();
+  const chunkSize = 2 * 1024 * 1024; // 2MB chunks
+  let offset = 0;
+
+  while (offset < blob.size) {
+    const chunk = blob.slice(offset, offset + chunkSize);
+    const buffer = await chunk.arrayBuffer();
+    hash.update(buffer);
+    offset += chunkSize;
+  }
+
+  const bytes = hash.array();
   let binary = '';
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte);
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
   }
   return btoa(binary);
 }

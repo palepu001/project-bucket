@@ -130,8 +130,16 @@ export function getMigrationDiagnostics(issueId: string): Promise<MigrationRun[]
   return callResolver('getMigrationDiagnostics', { issueId });
 }
 
-export function retryMigration(migrationId: string): Promise<MigrationRun> {
-  return callResolver('retryMigration', { migrationId });
+// Retries a FAILED or PARTIAL_FAILURE run via the async worker. Returns
+// { runId, status: 'RUNNING' } immediately — poll getMigrationRunStatus for the result.
+export function retryMigrationAsync(migrationId: string): Promise<{ runId: string; status: 'RUNNING' }> {
+  return callResolver('retryMigrationAsync', { migrationId });
+}
+
+// Polls the status of an in-progress migration run. The DiagnosticsTab calls
+// this after retryMigrationAsync until the run reaches a terminal state.
+export function getMigrationRunStatus(migrationId: string): Promise<MigrationRun | null> {
+  return callResolver('getMigrationRunStatus', { migrationId });
 }
 
 export function pollPendingSession(issueId: string): Promise<Session | null> {

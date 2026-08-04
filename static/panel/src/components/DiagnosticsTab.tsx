@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
 import * as api from '../api/resolvers';
-import { runMigration } from '../services/migrationClient';
 import { MigrationRun, MigrationRunStatus, MigrationItem } from '../types';
 import { StorageAuditItem } from '../api/resolvers';
+
 import { formatBytes, formatDate, formatDuration } from '../utils/format';
 import { LoadingState, ErrorState } from './States';
 
@@ -81,17 +81,24 @@ export function DiagnosticsTab({ issueId }: { issueId: string })  {
   async function handleRetry(run: MigrationRun) {
     setRetryingId(run.id);
     try {
-      const reopened = await api.retryMigration(run.id);
-      // runMigration re-stages whatever is still PENDING (a FAILED run) and then
-      // commits; for a PARTIAL_FAILURE run nothing is pending, so it goes
-      // straight to the commit that re-attempts the outstanding deletions.
-      // On a retry, sources that are definitively gone (404) are withdrawn so
-      // the surviving files migrate; the missing ones surface in the dialog.
-      const retried = await runMigration(reopened, { skipMissingSources: true });
-      const missing = retried.items
-        .filter((item: MigrationItem) => item.status === 'SOURCE_MISSING')
-        .map((item: MigrationItem) => item.filename);
-      if (missing.length > 0) setMissingFiles(missing);
+      // retryMigrationAsync resets items, re-opens the run, and enqueues the
+      // 900-second async worker. We poll getMigrationRunStatus for the result.
+      const queued = await api.retryMigrationAsync(run.id);
+
+      const POLL_INTERVAL_MS = 3000;
+      const MAX_POLLS = 200; // 10 minutes max
+      for (let i = 0; i < MAX_POLLS; i++) {
+        await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+        const status = await api.getMigrationRunStatus(queued.runId);
+        if (!status) break;
+        if (status.status === 'COMPLETED' || status.status === 'FAILED' || status.status === 'PARTIAL_FAILURE') {
+          const missing = status.items
+            .filter((item: MigrationItem) => item.status === 'SOURCE_MISSING')
+            .map((item: MigrationItem) => item.filename);
+          if (missing.length > 0) setMissingFiles(missing);
+          break;
+        }
+      }
     } finally {
       setRetryingId(null);
       refresh();

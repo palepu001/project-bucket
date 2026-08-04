@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@forge/bridge": "^6.1.0",
+    "js-sha256": "^1.0.0",
     "pdfjs-dist": "^6.1.200",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",

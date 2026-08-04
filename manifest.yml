@@ -83,6 +83,17 @@ modules:
   # resolver invocation after install races the migration. The schema
   # migrations themselves are idempotent (CREATE TABLE IF NOT EXISTS), so
   # running this hourly is a cheap no-op once the schema has been applied.
+  # Async queue for streaming large Jira attachments to Project Bucket storage.
+  # Consumers run under the extended 900-second (15-minute) timeout — large
+  # enough for even a 250 MB file at typical Forge egress speeds — rather than
+  # the 25-second cap that applies to ordinary resolver functions. The resolver
+  # migrateSessionOnBackend enqueues a job here and returns immediately; the
+  # browser's poll loop picks up the finished run when it appears in SQL.
+  consumer:
+    - key: migrate-session-consumer
+      queue: migrate-session-queue
+      function: migrate-session-worker
+
   scheduledTrigger:
     - key: schema-migration
       function: run-schema-migration
@@ -145,6 +156,13 @@ modules:
       handler: index.onIssueUpdated
     - key: graph-task-runner
       handler: index.onGraphTask
+    # Worker that performs the actual Jira→S3 byte transfer for one migration
+    # run. timeoutSeconds: 900 gives up to 15 minutes — enough for very large
+    # files (250 MB+) at typical Forge egress speeds. Without this the default
+    # 25-second resolver cap would always abort large-file migrations.
+    - key: migrate-session-worker
+      handler: index.onMigrateSessionEvent
+      timeoutSeconds: 900
 
 resources:
   - key: panel

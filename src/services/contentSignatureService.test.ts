@@ -7,6 +7,7 @@ function fakeProvider(bytes: number[] | null): AttachmentStorageProvider {
   return {
     containerName: 'test-bucket',
     upload: async () => ({ url: 'https://example.invalid/upload' }),
+    uploadStream: async () => undefined,
     download: async () => ({ url: 'https://example.invalid/download' }),
     stream: async () => null,
     readHeaderBytes: async () => (bytes === null ? null : new Uint8Array(bytes)),

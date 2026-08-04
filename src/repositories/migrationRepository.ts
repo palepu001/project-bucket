@@ -143,6 +143,17 @@ export async function getMigrationRun(migrationId: string): Promise<MigrationRun
   return toMigrationRun(rows[0], await fetchItems(migrationId));
 }
 
+export async function getActiveRunForSession(sessionId: string): Promise<MigrationRun | null> {
+  await ensureSchema();
+  const result = await sql
+    .prepare("SELECT * FROM migration_runs WHERE session_id = ? AND status = 'RUNNING' LIMIT 1")
+    .bindParams(sessionId)
+    .execute();
+  const rows = result.rows as unknown as MigrationRunRow[];
+  if (rows.length === 0) return null;
+  return toMigrationRun(rows[0], await fetchItems(rows[0].id));
+}
+
 export async function listMigrationRuns(issueId: string): Promise<MigrationRun[]> {
   await ensureSchema();
   const result = await sql
@@ -478,3 +489,33 @@ export async function releaseCommitLease(migrationId: string): Promise<void> {
     .bindParams(migrationId)
     .execute();
 }
+
+/**
+ * Prunes completed or failed migration runs (and their associated items)
+ * that are older than `retentionDays` (defaults to 30 days). Preserves recent
+ * run history for the diagnostics tab while keeping Forge SQL lean.
+ */
+export async function purgeOldMigrationRuns(retentionDays = 30): Promise<number> {
+  await ensureSchema();
+  const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
+  const cutoffSql = cutoff.toISOString().slice(0, 19).replace('T', ' ');
+
+  await sql
+    .prepare(
+      `DELETE FROM migration_items WHERE migration_id IN (
+        SELECT id FROM migration_runs WHERE status IN ('COMPLETED', 'FAILED', 'PARTIAL_FAILURE') AND started_at < ?
+      )`
+    )
+    .bindParams(cutoffSql)
+    .execute();
+
+  const res = await sql
+    .prepare(
+      "DELETE FROM migration_runs WHERE status IN ('COMPLETED', 'FAILED', 'PARTIAL_FAILURE') AND started_at < ?"
+    )
+    .bindParams(cutoffSql)
+    .execute();
+
+  return (res.rows as unknown as { affectedRows: number }).affectedRows || 0;
+}
+

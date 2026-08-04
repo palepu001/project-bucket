@@ -209,3 +209,41 @@ export async function markSessionDismissed(sessionId: string): Promise<void> {
     .bindParams(nowSqlDateTime(), sessionId)
     .execute();
 }
+
+export async function markSessionNotified(sessionId: string): Promise<void> {
+  await ensureSchema();
+  await sql
+    .prepare("UPDATE attachment_sessions SET status = 'NOTIFIED', notified_at = ? WHERE id = ?")
+    .bindParams(nowSqlDateTime(), sessionId)
+    .execute();
+}
+
+/**
+ * Prunes resolved or dismissed upload sessions (and their associated items)
+ * that are older than `retentionDays` (defaults to 7 days). Keeps Forge SQL
+ * lean without leaving stale session metadata around.
+ */
+export async function purgeOldSessions(retentionDays = 7): Promise<number> {
+  await ensureSchema();
+  const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
+  const cutoffSql = cutoff.toISOString().slice(0, 19).replace('T', ' ');
+
+  await sql
+    .prepare(
+      `DELETE FROM attachment_session_items WHERE session_id IN (
+        SELECT id FROM attachment_sessions WHERE status IN ('RESOLVED', 'DISMISSED') AND last_event_at < ?
+      )`
+    )
+    .bindParams(cutoffSql)
+    .execute();
+
+  const res = await sql
+    .prepare(
+      "DELETE FROM attachment_sessions WHERE status IN ('RESOLVED', 'DISMISSED') AND last_event_at < ?"
+    )
+    .bindParams(cutoffSql)
+    .execute();
+
+  return (res.rows as unknown as { affectedRows: number }).affectedRows || 0;
+}
+

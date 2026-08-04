@@ -93,6 +93,15 @@ export interface AttachmentStorageProvider {
   /** Prepare a byte transfer into `ref`, returning the request a client should issue. */
   upload(request: UploadRequest): Promise<UploadTarget>;
 
+  /** Upload a readable stream directly to the storage. */
+  uploadStream(
+    ref: string,
+    body: any,
+    length: number,
+    mimeType: string,
+    checksum: string
+  ): Promise<void>;
+
   /**
    * Return a URL a client can load to view the file at `ref`, or — when
    * `options.downloadFilename` is set — to save it under that name.
