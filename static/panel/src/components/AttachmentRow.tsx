@@ -2,17 +2,13 @@ import { useEffect, useState } from 'react';
 import { Attachment, classifyExtension } from '../types';
 import { FileIcon } from './FileIcon';
 import { formatBytes, formatDate } from '../utils/format';
+import { canRenderThumbnail } from '../services/thumbnailService';
 
 const WARNING_HINTS: Partial<Record<Attachment['syncStatus'], string>> = {
   SYNC_ERROR: 'Stored safely in Project Bucket, but the native Jira copy may still exist. Retry from Diagnostics.',
   QUARANTINED: 'This file has been quarantined and cannot be previewed or downloaded.',
 };
 
-// One row of the list view — the Name / Size / Date added layout from Jira's
-// native attachments list, with the same download + delete actions the grid
-// card exposes (surfaced on row hover/focus). A small thumbnail stands in for
-// the file-type icon when a rendition exists, so the list still previews at a
-// glance.
 export function AttachmentRow({
   attachment,
   uploaderName,
@@ -27,12 +23,25 @@ export function AttachmentRow({
   onPreview: () => void;
   onDownload: () => void;
   onDelete: () => void;
-})  {
+}) {
   const category = classifyExtension(attachment.extension);
   const warningHint = WARNING_HINTS[attachment.syncStatus];
 
   const [thumbnailBroken, setThumbnailBroken] = useState(false);
-  useEffect(() => setThumbnailBroken(false), [thumbnailUrl]);
+  const [imageLoaded, setImageLoaded] = useState(false);
+
+  useEffect(() => {
+    setThumbnailBroken(false);
+    setImageLoaded(false);
+  }, [thumbnailUrl]);
+
+  const isExpectingThumbnail =
+    canRenderThumbnail(attachment.filename, attachment.mimeType) &&
+    attachment.thumbnailStatus !== 'UNSUPPORTED' &&
+    attachment.thumbnailStatus !== 'FAILED' &&
+    !thumbnailBroken;
+
+  const showSkeleton = isExpectingThumbnail && (!thumbnailUrl || !imageLoaded);
   const showThumbnail = Boolean(thumbnailUrl) && !thumbnailBroken;
 
   return (
@@ -46,12 +55,22 @@ export function AttachmentRow({
         aria-label={`Preview ${attachment.filename}`}
       >
         <span className="pb-row-thumb">
-          {showThumbnail ? (
-            <img src={thumbnailUrl} alt="" loading="lazy" onError={() => setThumbnailBroken(true)} />
+          {showSkeleton ? (
+            <div className="pb-skeleton pb-row-thumb-skeleton" aria-hidden="true" />
+          ) : showThumbnail ? (
+            <img
+              className={imageLoaded ? 'pb-thumb-loaded' : 'pb-thumb-loading'}
+              src={thumbnailUrl}
+              alt=""
+              loading="lazy"
+              onLoad={() => setImageLoaded(true)}
+              onError={() => setThumbnailBroken(true)}
+            />
           ) : (
             <FileIcon category={category} extension={attachment.extension} />
           )}
         </span>
+
         <span className="pb-row-filename">{attachment.filename}</span>
         {warningHint && (
           <span className="pb-row-warning" role="img" aria-label="Attention needed" title={warningHint}>

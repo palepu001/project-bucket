@@ -304,6 +304,49 @@ body {
   object-position: center top;
 }
 
+/* Jira-style Shimmer Loading Skeleton */
+@keyframes pb-skeleton-shimmer {
+  0% {
+    background-position: -200px 0;
+  }
+  100% {
+    background-position: calc(200px + 100%) 0;
+  }
+}
+
+.pb-skeleton {
+  background: #f4f5f7 linear-gradient(90deg, #f4f5f7 0%, #ebecf0 50%, #f4f5f7 100%) no-repeat;
+  background-size: 200px 100%;
+  animation: pb-skeleton-shimmer 1.4s ease-in-out infinite;
+}
+
+.pb-card-thumb-skeleton {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  border-radius: 3px 3px 0 0;
+  z-index: 1;
+}
+
+.pb-row-thumb-skeleton {
+  display: inline-block;
+  width: 24px;
+  height: 24px;
+  border-radius: 3px;
+}
+
+.pb-thumb-loading {
+  opacity: 0;
+}
+
+.pb-thumb-loaded {
+  opacity: 1;
+  transition: opacity 0.2s ease-in;
+}
+
+
 .pb-card-footer {
   display: flex;
   flex-direction: column;

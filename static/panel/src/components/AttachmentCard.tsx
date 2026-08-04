@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { Attachment, classifyExtension } from '../types';
 import { FileIcon } from './FileIcon';
 import { formatBytes, formatDate } from '../utils/format';
+import { canRenderThumbnail } from '../services/thumbnailService';
 
 const WARNING_HINTS: Partial<Record<Attachment['syncStatus'], string>> = {
   SYNC_ERROR: 'Stored safely in Project Bucket, but the native Jira copy may still exist. Retry from Diagnostics.',
@@ -22,34 +23,45 @@ export function AttachmentCard({
   onPreview: () => void;
   onDownload: () => void;
   onDelete: () => void;
-})  {
+}) {
   const category = classifyExtension(attachment.extension);
   const warningHint = WARNING_HINTS[attachment.syncStatus];
 
-  // A presigned thumbnail URL can stop working while the panel is open — it
-  // expires after an hour, and the object can be removed underneath us. Without
-  // this the card would paint the browser's broken-image glyph; falling back to
-  // the file-type icon keeps the grid looking deliberate either way. Reset on
-  // url change so a re-minted URL gets a fresh chance.
   const [thumbnailBroken, setThumbnailBroken] = useState(false);
-  useEffect(() => setThumbnailBroken(false), [thumbnailUrl]);
+  const [imageLoaded, setImageLoaded] = useState(false);
+
+  useEffect(() => {
+    setThumbnailBroken(false);
+    setImageLoaded(false);
+  }, [thumbnailUrl]);
+
+  const isExpectingThumbnail =
+    canRenderThumbnail(attachment.filename, attachment.mimeType) &&
+    attachment.thumbnailStatus !== 'UNSUPPORTED' &&
+    attachment.thumbnailStatus !== 'FAILED' &&
+    !thumbnailBroken;
+
+  const showSkeleton = isExpectingThumbnail && (!thumbnailUrl || !imageLoaded);
   const showThumbnail = Boolean(thumbnailUrl) && !thumbnailBroken;
 
   return (
     <div className="pb-card" title={`${attachment.filename}\n${formatBytes(attachment.size)} · added by ${uploaderName}`}>
       <div className="pb-card-preview" onClick={onPreview} role="button" tabIndex={0} onKeyDown={(e) => e.key === 'Enter' && onPreview()} aria-label={`Preview ${attachment.filename}`}>
+        {showSkeleton && <div className="pb-skeleton pb-card-thumb-skeleton" aria-hidden="true" />}
         {showThumbnail ? (
           <img
-            className="pb-card-thumb"
+            className={`pb-card-thumb ${imageLoaded ? 'pb-thumb-loaded' : 'pb-thumb-loading'}`}
             src={thumbnailUrl}
             alt=""
             loading="lazy"
+            onLoad={() => setImageLoaded(true)}
             onError={() => setThumbnailBroken(true)}
           />
-        ) : (
+        ) : !showSkeleton ? (
           <FileIcon category={category} extension={attachment.extension} />
-        )}
+        ) : null}
       </div>
+
 
       <div className="pb-card-footer">
         <span className="pb-card-name" title={attachment.filename}>{attachment.filename}</span>
