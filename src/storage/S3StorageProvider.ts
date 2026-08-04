@@ -69,6 +69,7 @@ export class S3StorageProvider implements AttachmentStorageProvider {
         accessKeyId: creds.accessKeyId,
         secretAccessKey: creds.secretAccessKey,
       },
+      requestStreamBufferSize: 65536,
     });
     this.containerName = bucketName;
   }
@@ -105,6 +106,24 @@ export class S3StorageProvider implements AttachmentStorageProvider {
         'x-amz-checksum-sha256': request.checksum,
       },
     };
+  }
+
+  async uploadStream(
+    ref: string,
+    body: any,
+    length: number,
+    mimeType: string,
+    checksum: string
+  ): Promise<void> {
+    const command = new PutObjectCommand({
+      Bucket: this.bucket,
+      Key: ref,
+      Body: body,
+      ContentLength: length,
+      ContentType: mimeType,
+      ...(checksum ? { ChecksumSHA256: checksum } : {}),
+    });
+    await this.s3.send(command);
   }
 
   async download(ref: string, options?: DownloadOptions): Promise<ViewUrl> {

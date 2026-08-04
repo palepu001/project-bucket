@@ -261,3 +261,11 @@ export async function pollPendingSession(issueId: string): Promise<Session | nul
 export async function recoverStaleMigration(issueId: string): Promise<MigrationRun | null> {
   return callResolver<MigrationRun | null>('recoverStaleMigration', { issueId });
 }
+
+export async function migrateSessionOnBackend(params: {
+  sessionId: string;
+  issueId: string;
+  projectId: string;
+}): Promise<MigrationRun> {
+  return callResolver<MigrationRun>('migrateSessionOnBackend', params);
+}

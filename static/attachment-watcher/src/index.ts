@@ -1,5 +1,5 @@
 import { view, showFlag, events, Modal } from '@forge/bridge';
-import { pollPendingSession, dismissSession, beginMigration, runMigration, retryMigration, recoverStaleMigration } from './migrationClient';
+import { pollPendingSession, dismissSession, runMigration, retryMigration, recoverStaleMigration, migrateSessionOnBackend } from './migrationClient';
 import { MigrationRun, Session } from './types';
 
 // ---------------------------------------------------------------------------
@@ -155,18 +155,15 @@ async function presentDetectionPopup(context: WatcherContext, session: Session):
 }
 
 async function runMigrationForSession(context: WatcherContext, session: Session): Promise<void> {
-  console.log('[ProjectBucket] runMigrationForSession: starting, session.id =', session.id, 'items =', session.items.length);
+  console.log('[ProjectBucket] runMigrationForSession: starting on backend, session.id =', session.id, 'items =', session.items.length);
   migrationInFlight = true;
   try {
-    const run = await beginMigration({
+    const finished = await migrateSessionOnBackend({
+      sessionId: session.id,
       issueId: context.issueId,
       projectId: context.projectId,
-      sessionId: session.id,
-      items: session.items.map((item) => ({ jiraAttachmentId: item.jiraAttachmentId, filename: item.filename })),
     });
-    console.log('[ProjectBucket] runMigrationForSession: beginMigration ok, run.id =', run.id, 'run.status =', run.status);
-    const finished = await runMigration(run);
-    console.log('[ProjectBucket] runMigrationForSession: runMigration finished, status =', finished.status);
+    console.log('[ProjectBucket] runMigrationForSession: migrateSessionOnBackend finished, status =', finished.status);
     await presentSummaryFlag(context, finished);
     await maybeRefreshIssueView(finished);
   } catch (error) {

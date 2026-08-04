@@ -59,8 +59,8 @@ test('a denied MIME type is blocked even with an allowed extension', async () =>
 });
 
 test('an unknown extension with harmless bytes is accepted', async () => {
-  // .exr with random non-dangerous bytes — should pass through.
-  const result = await validateMigratedBlob(blobOf([0x76, 0x2F, 0x31, 0x20], 64), 'plate.exr', 'application/octet-stream');
+  // .blend with random non-dangerous bytes — should pass through.
+  const result = await validateMigratedBlob(blobOf([0x76, 0x2F, 0x31, 0x20], 64), 'plate.blend', 'application/octet-stream');
   assert.equal(result.passed, true);
 });
 

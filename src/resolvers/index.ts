@@ -757,4 +757,23 @@ resolver.define('resolveIssueContext', async (req) => {
   return { issueId: data.id as string, projectId: data.fields?.project?.id as string };
 });
 
+resolver.define('migrateSessionOnBackend', async (req) => {
+  const { sessionId, issueId, projectId } = req.payload as {
+    sessionId: string;
+    issueId: string;
+    projectId: string;
+  };
+  const actorAccountId = requireAccountId(req.context);
+  const cloudId = req.context.cloudId;
+  if (!cloudId) throw new Error('Could not resolve cloudId from context');
+
+  return migrationService.migrateSessionOnBackend({
+    sessionId,
+    issueId,
+    projectId,
+    actorAccountId,
+    cloudId,
+  });
+});
+
 export const handler = resolver.getDefinitions();

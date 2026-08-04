@@ -209,3 +209,11 @@ export async function markSessionDismissed(sessionId: string): Promise<void> {
     .bindParams(nowSqlDateTime(), sessionId)
     .execute();
 }
+
+export async function markSessionNotified(sessionId: string): Promise<void> {
+  await ensureSchema();
+  await sql
+    .prepare("UPDATE attachment_sessions SET status = 'NOTIFIED', notified_at = ? WHERE id = ?")
+    .bindParams(nowSqlDateTime(), sessionId)
+    .execute();
+}

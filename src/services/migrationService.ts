@@ -1,9 +1,10 @@
-import { randomUUID } from 'crypto';
+import { randomUUID, createHash, Hash } from 'crypto';
+import { Transform, TransformCallback, Readable } from 'stream';
 import * as migrationRepository from '../repositories/migrationRepository';
 import { StagedMigrationItem as StagedItem } from '../repositories/migrationRepository';
 import * as sessionRepository from '../repositories/sessionRepository';
 import * as attachmentRepository from '../repositories/attachmentRepository';
-import { deleteNativeAttachment, getAttachmentMetadata } from './jiraAttachmentSource';
+import { deleteNativeAttachment, getAttachmentMetadata, downloadNativeAttachmentStream } from './jiraAttachmentSource';
 import * as graphSyncService from './graphSyncService';
 import { resolveMediaId, removeMediaReferences } from './jiraContentCleanup';
 import { getStorageProvider, ChecksumType, ExistenceResult } from '../storage';
@@ -1030,4 +1031,160 @@ async function abortAbandonedRun(
 
 export async function listMigrationRunsForIssue(issueId: string): Promise<MigrationRun[]> {
   return migrationRepository.listMigrationRuns(issueId);
+}
+
+export class HashingStream extends Transform {
+  private hash: Hash;
+  private bytesWritten: number = 0;
+
+  constructor() {
+    super();
+    this.hash = createHash('sha256');
+  }
+
+  _transform(chunk: any, _encoding: BufferEncoding, callback: TransformCallback): void {
+    this.bytesWritten += chunk.length;
+    this.hash.update(chunk);
+    this.push(chunk);
+    callback();
+  }
+
+  getHashBase64(): string {
+    return this.hash.digest('base64');
+  }
+
+  getBytesWritten(): number {
+    return this.bytesWritten;
+  }
+}
+
+export function getReadableStream(readable: any): Readable {
+  if (readable instanceof Readable) {
+    return readable;
+  }
+  if (readable && typeof readable.getReader === 'function') {
+    const reader = readable.getReader();
+    return new Readable({
+      async read() {
+        try {
+          const { done, value } = await reader.read();
+          if (done) {
+            this.push(null);
+          } else {
+            this.push(Buffer.from(value));
+          }
+        } catch (err: any) {
+          this.destroy(err);
+        }
+      }
+    });
+  }
+  return Readable.from(readable);
+}
+
+export async function migrateSessionOnBackend(params: {
+  sessionId: string;
+  issueId: string;
+  projectId: string;
+  actorAccountId: string;
+  cloudId: string;
+}): Promise<MigrationRun> {
+  const { sessionId, issueId, projectId, actorAccountId, cloudId } = params;
+
+  const session = await sessionRepository.getSessionById(sessionId);
+  if (!session) throw new Error(`Attachment session "${sessionId}" not found`);
+
+  await sessionRepository.markSessionNotified(sessionId);
+
+  const run = await beginMigration({
+    issueId,
+    projectId,
+    sessionId,
+    triggeredBy: actorAccountId,
+    items: session.items.map((item) => ({
+      jiraAttachmentId: item.jiraAttachmentId,
+      filename: item.filename,
+    })),
+  });
+
+  const runItems = await migrationRepository.getStagedMigrationItems(run.id);
+
+  for (const item of runItems) {
+    if (item.status !== 'PENDING' && item.status !== 'UPLOADING') {
+      continue;
+    }
+
+    try {
+      await migrationRepository.updateMigrationItem(item.id, {
+        status: 'UPLOADING',
+        startedAt: true,
+      });
+
+      const meta = await getAttachmentMetadata(item.jiraAttachmentId);
+      if (!meta) {
+        throw new Error('Attachment is missing in Jira');
+      }
+
+      const downloadStream = await downloadNativeAttachmentStream(item.jiraAttachmentId);
+      const hasher = new HashingStream();
+      const piped = getReadableStream(downloadStream).pipe(hasher);
+
+      const hierarchy = await getIssueHierarchy(run.issueId);
+      const storageContext: StorageKeyContext = {
+        cloudId,
+        projectKey: hierarchy.projectKey,
+        issueKey: hierarchy.issueKey,
+        epicKey: hierarchy.epicKey,
+      };
+      const objectKey = generateStorageKey(storageContext);
+
+      const provider = await getStorageProvider({ projectId: run.projectId });
+      await provider.uploadStream(
+        objectKey,
+        piped,
+        meta.size,
+        meta.mimeType,
+        ''
+      );
+
+      const finalChecksum = hasher.getHashBase64();
+      const bytesWritten = hasher.getBytesWritten();
+      if (bytesWritten !== meta.size) {
+        throw new Error(`Size mismatch: expected ${meta.size} bytes, got ${bytesWritten}`);
+      }
+
+      await stageMigrationItem({
+        migrationId: run.id,
+        itemId: item.id,
+        objectKey,
+        mimeType: meta.mimeType,
+        size: bytesWritten,
+        checksum: finalChecksum,
+      });
+    } catch (error: any) {
+      console.error(`[ProjectBucket] migrateSessionOnBackend: item ${item.filename} failed:`, error);
+      await failMigrationItem({
+        migrationId: run.id,
+        itemId: item.id,
+        error: error.message || String(error),
+      });
+    }
+  }
+
+  const freshItems = await migrationRepository.getStagedMigrationItems(run.id);
+  const resumable = selectResumableItems(freshItems);
+  if (resumable.length === 0) {
+    const acquiredLease = await migrationRepository.claimCommitLease(run.id, COMMIT_LEASE_MS);
+    if (acquiredLease) {
+      try {
+        await commitUnderLease(run, actorAccountId);
+      } finally {
+        await migrationRepository.releaseCommitLease(run.id).catch(() => undefined);
+      }
+    }
+  }
+
+  const finalRun = await migrationRepository.getMigrationRun(run.id);
+  if (!finalRun) throw new Error(`Migration run "${run.id}" not found after execution`);
+  return finalRun;
 }

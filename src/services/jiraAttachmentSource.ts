@@ -52,3 +52,12 @@ export async function getIssueProjectIdAsApp(issueId: string): Promise<string> {
   const body = (await response.json()) as { fields: { project: { id: string } } };
   return body.fields.project.id;
 }
+
+/** Used by resolvers to stream download attachment content. */
+export async function downloadNativeAttachmentStream(attachmentId: string): Promise<any> {
+  const response = await api.asUser().requestJira(route`/rest/api/3/attachment/content/${attachmentId}`);
+  if (!response.ok) {
+    throw new Error(`Failed to download native attachment content ${attachmentId}: HTTP ${response.status}`);
+  }
+  return (response as any).body;
+}
