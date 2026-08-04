@@ -1210,27 +1210,41 @@ export async function executeMigrationRun(migrationId: string, cloudId: string):
       console.log(`[ProjectBucket] executeMigrationRun: staged "${item.filename}" successfully`);
     } catch (error: any) {
       console.error(`[ProjectBucket] executeMigrationRun: item "${item.filename}" failed:`, error);
-      await failMigrationItem({
-        migrationId,
-        itemId: item.id,
-        error: error.message || String(error),
-      });
+      const isMissing =
+        error.message?.includes('missing in Jira') ||
+        error.message?.includes('404') ||
+        error.status === 404;
+
+      if (isMissing) {
+        await migrationRepository.updateMigrationItem(item.id, {
+          status: 'SOURCE_MISSING',
+          errorMessage: 'Attachment no longer exists in Jira',
+          completedAt: true,
+        });
+      } else {
+        await failMigrationItem({
+          migrationId,
+          itemId: item.id,
+          error: error.message || String(error),
+        });
+      }
     }
   }
 
-  // All items processed — attempt to commit the run (persist metadata, delete
-  // native Jira copies). Uses the same commit-lease mechanism as the browser
-  // path so concurrent calls are safely serialised.
-  const freshItems = await migrationRepository.getStagedMigrationItems(migrationId);
-  const resumable = selectResumableItems(freshItems);
-  if (resumable.length === 0) {
-    const acquiredLease = await migrationRepository.claimCommitLease(migrationId, COMMIT_LEASE_MS);
-    if (acquiredLease) {
-      try {
-        await commitUnderLease(run, actorAccountId);
-      } finally {
-        await migrationRepository.releaseCommitLease(migrationId).catch(() => undefined);
-      }
+  // All items processed in this worker execution — commit or finalize the run.
+  // Acquire the commit lease (releasing any temporary recovery lease if needed)
+  // so the run transitions to COMPLETED or FAILED and never gets stuck in RUNNING.
+  let acquiredLease = await migrationRepository.claimCommitLease(migrationId, COMMIT_LEASE_MS);
+  if (!acquiredLease) {
+    await migrationRepository.releaseCommitLease(migrationId).catch(() => undefined);
+    acquiredLease = await migrationRepository.claimCommitLease(migrationId, COMMIT_LEASE_MS);
+  }
+
+  if (acquiredLease) {
+    try {
+      await commitUnderLease(run, actorAccountId);
+    } finally {
+      await migrationRepository.releaseCommitLease(migrationId).catch(() => undefined);
     }
   }
 
@@ -1239,6 +1253,7 @@ export async function executeMigrationRun(migrationId: string, cloudId: string):
     `[ProjectBucket] executeMigrationRun: run ${migrationId} finished with status=${finalRun?.status ?? 'unknown'}`
   );
 }
+
 
 export async function forceRecoverSessionMigration(sessionId: string): Promise<MigrationRun | null> {
   const run = await migrationRepository.getActiveRunForSession(sessionId);
