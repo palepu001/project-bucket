@@ -1082,113 +1082,162 @@ export function getReadableStream(readable: any): Readable {
   return Readable.from(readable);
 }
 
+// ---------------------------------------------------------------------------
+// Called from the migrateSessionOnBackend RESOLVER — runs under the standard
+// 25-second Forge function limit, so it only creates the DB run and queues an
+// async event. The actual byte-streaming happens in executeMigrationRun below,
+// which is called by the 900-second async worker (onMigrateSessionEvent).
+// ---------------------------------------------------------------------------
 export async function migrateSessionOnBackend(params: {
   sessionId: string;
   issueId: string;
   projectId: string;
   actorAccountId: string;
   cloudId: string;
-}): Promise<MigrationRun> {
-  const { sessionId, issueId, projectId, actorAccountId, cloudId } = params;
+  items: { jiraAttachmentId: string; filename: string }[];
+}): Promise<{ runId: string; status: 'RUNNING' }> {
+  const { sessionId, issueId, projectId, actorAccountId, cloudId, items } = params;
 
   const session = await sessionRepository.getSessionById(sessionId);
   if (!session) throw new Error(`Attachment session "${sessionId}" not found`);
 
   await sessionRepository.markSessionNotified(sessionId);
 
+  // Create the DB run synchronously — this is fast (a few SQL inserts) and
+  // must happen here so the browser's poll loop has a runId to track.
   const run = await beginMigration({
     issueId,
     projectId,
     sessionId,
     triggeredBy: actorAccountId,
-    items: session.items.map((item) => ({
-      jiraAttachmentId: item.jiraAttachmentId,
-      filename: item.filename,
-    })),
+    items,
   });
 
-  const runItems = await migrationRepository.getStagedMigrationItems(run.id);
+  // Push the heavy streaming work onto the async queue. The worker (see
+  // src/index.ts onMigrateSessionEvent) has up to 900 seconds to complete it.
+  // We import Queue lazily to avoid requiring @forge/events in test contexts
+  // that do not have the Forge runtime environment available.
+  const { Queue } = await import('@forge/events');
+  // QueueParams uses 'key' (the queue name declared in manifest.yml).
+  // push() takes a PushEvent<T> which wraps the payload in a 'body' property;
+  // the async consumer receives event.body with these fields.
+  const migrationQueue = new Queue({ key: 'migrate-session-queue' });
+  await migrationQueue.push({ body: { migrationId: run.id, cloudId } });
 
-  await Promise.all(
-    runItems.map(async (item) => {
-      if (item.status !== 'PENDING' && item.status !== 'UPLOADING') {
-        return;
+  console.log(`[ProjectBucket] migrateSessionOnBackend: queued async job for run ${run.id} (${items.length} item(s))`);
+
+  // Return the runId immediately. The browser watcher polls getMigrationRunStatus
+  // until the async worker marks the run COMPLETED, FAILED, or PARTIAL_FAILURE.
+  return { runId: run.id, status: 'RUNNING' };
+}
+
+// ---------------------------------------------------------------------------
+// Called from the ASYNC WORKER (onMigrateSessionEvent in src/index.ts).
+// Runs under a 900-second Forge function timeout so even large files (250 MB+)
+// can be fully downloaded from Jira and uploaded to S3 without timing out.
+// ---------------------------------------------------------------------------
+export async function executeMigrationRun(migrationId: string, cloudId: string): Promise<void> {
+  const run = await migrationRepository.getMigrationRun(migrationId);
+  if (!run) throw new Error(`Migration run "${migrationId}" not found`);
+
+  // Guard: if the run is already in a terminal state (e.g. committed by the
+  // consistency sweep or a concurrent call) there is nothing to do.
+  if (run.status !== 'RUNNING') {
+    console.log(`[ProjectBucket] executeMigrationRun: run ${migrationId} is already ${run.status}, skipping`);
+    return;
+  }
+
+  // Who triggered this migration? Needed for commitUnderLease → attachmentRepository.
+  // It is stored as triggered_by on the run row.
+  const actorAccountId = (run as any).triggeredBy ?? 'system';
+
+  const runItems = await migrationRepository.getStagedMigrationItems(migrationId);
+
+  // Stream each PENDING/UPLOADING item: download from Jira, pipe through the
+  // hashing transform, and PUT into the S3-compatible object store. Items run
+  // sequentially to avoid overwhelming the Jira download endpoint or Forge's
+  // egress concurrency limits. The 900-second timeout makes this safe for any
+  // realistic file count and size.
+  for (const item of runItems) {
+    if (item.status !== 'PENDING' && item.status !== 'UPLOADING') {
+      continue;
+    }
+
+    try {
+      await migrationRepository.updateMigrationItem(item.id, {
+        status: 'UPLOADING',
+        startedAt: true,
+      });
+
+      const meta = await getAttachmentMetadata(item.jiraAttachmentId);
+      if (!meta) {
+        throw new Error('Attachment is missing in Jira');
       }
 
-      try {
-        await migrationRepository.updateMigrationItem(item.id, {
-          status: 'UPLOADING',
-          startedAt: true,
-        });
+      console.log(`[ProjectBucket] executeMigrationRun: streaming "${item.filename}" (${meta.size} bytes)`);
 
-        const meta = await getAttachmentMetadata(item.jiraAttachmentId);
-        if (!meta) {
-          throw new Error('Attachment is missing in Jira');
-        }
+      const downloadStream = await downloadNativeAttachmentStream(item.jiraAttachmentId);
+      const hasher = new HashingStream();
+      const piped = getReadableStream(downloadStream).pipe(hasher);
 
-        const downloadStream = await downloadNativeAttachmentStream(item.jiraAttachmentId);
-        const hasher = new HashingStream();
-        const piped = getReadableStream(downloadStream).pipe(hasher);
+      const hierarchy = await getIssueHierarchy(run.issueId);
+      const storageContext: StorageKeyContext = {
+        cloudId,
+        projectKey: hierarchy.projectKey,
+        issueKey: hierarchy.issueKey,
+        epicKey: hierarchy.epicKey,
+      };
+      const objectKey = generateStorageKey(storageContext);
 
-        const hierarchy = await getIssueHierarchy(run.issueId);
-        const storageContext: StorageKeyContext = {
-          cloudId,
-          projectKey: hierarchy.projectKey,
-          issueKey: hierarchy.issueKey,
-          epicKey: hierarchy.epicKey,
-        };
-        const objectKey = generateStorageKey(storageContext);
+      const provider = await getStorageProvider({ projectId: run.projectId });
+      await provider.uploadStream(objectKey, piped, meta.size, meta.mimeType, '');
 
-        const provider = await getStorageProvider({ projectId: run.projectId });
-        await provider.uploadStream(
-          objectKey,
-          piped,
-          meta.size,
-          meta.mimeType,
-          ''
-        );
-
-        const finalChecksum = hasher.getHashBase64();
-        const bytesWritten = hasher.getBytesWritten();
-        if (bytesWritten !== meta.size) {
-          throw new Error(`Size mismatch: expected ${meta.size} bytes, got ${bytesWritten}`);
-        }
-
-        await stageMigrationItem({
-          migrationId: run.id,
-          itemId: item.id,
-          objectKey,
-          mimeType: meta.mimeType,
-          size: bytesWritten,
-          checksum: finalChecksum,
-        });
-      } catch (error: any) {
-        console.error(`[ProjectBucket] migrateSessionOnBackend: item ${item.filename} failed:`, error);
-        await failMigrationItem({
-          migrationId: run.id,
-          itemId: item.id,
-          error: error.message || String(error),
-        });
+      const finalChecksum = hasher.getHashBase64();
+      const bytesWritten = hasher.getBytesWritten();
+      if (bytesWritten !== meta.size) {
+        throw new Error(`Size mismatch: expected ${meta.size} bytes, got ${bytesWritten}`);
       }
-    })
-  );
 
-  const freshItems = await migrationRepository.getStagedMigrationItems(run.id);
+      await stageMigrationItem({
+        migrationId,
+        itemId: item.id,
+        objectKey,
+        mimeType: meta.mimeType,
+        size: bytesWritten,
+        checksum: finalChecksum,
+      });
+
+      console.log(`[ProjectBucket] executeMigrationRun: staged "${item.filename}" successfully`);
+    } catch (error: any) {
+      console.error(`[ProjectBucket] executeMigrationRun: item "${item.filename}" failed:`, error);
+      await failMigrationItem({
+        migrationId,
+        itemId: item.id,
+        error: error.message || String(error),
+      });
+    }
+  }
+
+  // All items processed — attempt to commit the run (persist metadata, delete
+  // native Jira copies). Uses the same commit-lease mechanism as the browser
+  // path so concurrent calls are safely serialised.
+  const freshItems = await migrationRepository.getStagedMigrationItems(migrationId);
   const resumable = selectResumableItems(freshItems);
   if (resumable.length === 0) {
-    const acquiredLease = await migrationRepository.claimCommitLease(run.id, COMMIT_LEASE_MS);
+    const acquiredLease = await migrationRepository.claimCommitLease(migrationId, COMMIT_LEASE_MS);
     if (acquiredLease) {
       try {
         await commitUnderLease(run, actorAccountId);
       } finally {
-        await migrationRepository.releaseCommitLease(run.id).catch(() => undefined);
+        await migrationRepository.releaseCommitLease(migrationId).catch(() => undefined);
       }
     }
   }
 
-  const finalRun = await migrationRepository.getMigrationRun(run.id);
-  if (!finalRun) throw new Error(`Migration run "${run.id}" not found after execution`);
-  return finalRun;
+  const finalRun = await migrationRepository.getMigrationRun(migrationId);
+  console.log(
+    `[ProjectBucket] executeMigrationRun: run ${migrationId} finished with status=${finalRun?.status ?? 'unknown'}`
+  );
 }
 
 export async function forceRecoverSessionMigration(sessionId: string): Promise<MigrationRun | null> {
@@ -1203,3 +1252,4 @@ export async function forceRecoverSessionMigration(sessionId: string): Promise<M
   }
   return migrationRepository.getMigrationRun(run.id);
 }
+

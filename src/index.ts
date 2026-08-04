@@ -11,8 +11,47 @@ import * as graphSyncService from './services/graphSyncService';
 import * as storageConsistencyService from './services/storageConsistencyService';
 import * as migrationService from './services/migrationService';
 import { recordDetectedAttachment } from './services/sessionService';
+import { purgeOldSessions } from './repositories/sessionRepository';
+import { purgeOldMigrationRuns } from './repositories/migrationRepository';
+
 
 export { handler } from './resolvers';
+
+// ---------------------------------------------------------------------------
+// Async event consumer — large file migration worker.
+// Invoked by Forge's async queue whenever migrateSessionOnBackend enqueues a
+// job. This function runs under the "migrate-session-worker" function in the
+// manifest, which has timeoutSeconds: 900. That gives up to 15 minutes to
+// stream even a 250 MB file from Jira to S3, compared to the standard 25-second
+// cap that applies to ordinary resolver functions.
+// ---------------------------------------------------------------------------
+interface MigrateSessionEvent {
+  jobId?: string;
+  body?: {
+    migrationId?: string;
+    cloudId?: string;
+  };
+}
+
+export const onMigrateSessionEvent = async (event: MigrateSessionEvent): Promise<void> => {
+  const { migrationId, cloudId } = event?.body ?? {};
+
+  if (!migrationId || !cloudId) {
+    console.error('[ProjectBucket] onMigrateSessionEvent: missing migrationId or cloudId in event body', event?.body);
+    return;
+  }
+
+  console.log(`[ProjectBucket] onMigrateSessionEvent: starting migration run ${migrationId}`);
+
+  try {
+    await migrationService.executeMigrationRun(migrationId, cloudId);
+  } catch (error) {
+    console.error(`[ProjectBucket] onMigrateSessionEvent: migration run ${migrationId} failed:`, error);
+    // Do not rethrow — Forge would retry the event, but a hard failure
+    // (e.g. attachment already deleted from Jira) is permanent. The run
+    // will remain in RUNNING state and be cleaned up by the consistency sweep.
+  }
+};
 
 // ---------------------------------------------------------------------------
 // Product trigger — fires once per native Jira attachment creation, site-wide.
@@ -138,7 +177,20 @@ export const runConsistencySweep = async (): Promise<void> => {
   } catch (error) {
     console.error('[ProjectBucket] Consistency sweep: abandoned migration sweep failed:', error);
   }
+
+  try {
+    const prunedSessions = await purgeOldSessions(7);
+    const prunedRuns = await purgeOldMigrationRuns(30);
+    if (prunedSessions > 0 || prunedRuns > 0) {
+      console.log(
+        `[ProjectBucket] Consistency sweep log cleanup: pruned ${prunedSessions} session(s) and ${prunedRuns} migration run(s)`
+      );
+    }
+  } catch (error) {
+    console.error('[ProjectBucket] Consistency sweep log cleanup failed:', error);
+  }
 };
+
 
 // ---------------------------------------------------------------------------
 // Teamwork Graph connector lifecycle (F7). Invoked by the graph:connector

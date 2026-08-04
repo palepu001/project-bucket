@@ -489,3 +489,33 @@ export async function releaseCommitLease(migrationId: string): Promise<void> {
     .bindParams(migrationId)
     .execute();
 }
+
+/**
+ * Prunes completed or failed migration runs (and their associated items)
+ * that are older than `retentionDays` (defaults to 30 days). Preserves recent
+ * run history for the diagnostics tab while keeping Forge SQL lean.
+ */
+export async function purgeOldMigrationRuns(retentionDays = 30): Promise<number> {
+  await ensureSchema();
+  const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
+  const cutoffSql = cutoff.toISOString().slice(0, 19).replace('T', ' ');
+
+  await sql
+    .prepare(
+      `DELETE FROM migration_items WHERE migration_id IN (
+        SELECT id FROM migration_runs WHERE status IN ('COMPLETED', 'FAILED', 'PARTIAL_FAILURE') AND started_at < ?
+      )`
+    )
+    .bindParams(cutoffSql)
+    .execute();
+
+  const res = await sql
+    .prepare(
+      "DELETE FROM migration_runs WHERE status IN ('COMPLETED', 'FAILED', 'PARTIAL_FAILURE') AND started_at < ?"
+    )
+    .bindParams(cutoffSql)
+    .execute();
+
+  return (res.rows as unknown as { affectedRows: number }).affectedRows || 0;
+}
+

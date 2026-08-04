@@ -1,6 +1,7 @@
 import { view, showFlag, events, Modal } from '@forge/bridge';
-import { pollPendingSession, dismissSession, runMigration, retryMigration, recoverStaleMigration, migrateSessionOnBackend, forceRecoverSessionMigration } from './migrationClient';
+import { pollPendingSession, dismissSession, recoverStaleMigration, migrateSessionOnBackend, getMigrationRunStatus, retryMigrationAsync } from './migrationClient';
 import { MigrationRun, Session } from './types';
+
 
 // ---------------------------------------------------------------------------
 // Project Bucket attachment watcher.
@@ -69,6 +70,41 @@ interface JiraBackgroundScriptContext {
 // inside pollOnce.
 let migrationInFlight = false;
 
+// ---------------------------------------------------------------------------
+// Shared async-worker poller. All migration paths (Link All, Retry, Resume)
+// queue work on the backend and then call this. It polls every 3 seconds for
+// up to 10 minutes (200 polls × 3 s = 600 s), which covers a 250 MB+ file at
+// typical Forge egress speed. Resolves with the terminal MigrationRun or
+// throws if the timeout elapses before the run finishes.
+// ---------------------------------------------------------------------------
+async function pollUntilDone(runId: string): Promise<MigrationRun> {
+  const POLL_INTERVAL_MS = 3000;
+  const MAX_POLLS = 200;
+
+  for (let i = 0; i < MAX_POLLS; i++) {
+    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+    const status = await getMigrationRunStatus(runId);
+
+    if (!status) {
+      // Run disappeared from DB — should never happen, but treat as fatal.
+      throw new Error('Migration run disappeared unexpectedly. Please retry.');
+    }
+
+    if (status.status === 'COMPLETED' || status.status === 'FAILED' || status.status === 'PARTIAL_FAILURE') {
+      return status;
+    }
+
+    console.log(`[ProjectBucket] pollUntilDone: poll ${i + 1}/${MAX_POLLS} — run ${runId} still ${status.status}`);
+  }
+
+  // Timed out. The run is still in progress on the backend — the consistency
+  // sweep will eventually clean it up. Tell the user to check back later.
+  throw new Error(
+    'Migration is taking longer than expected. The files will continue to transfer in the background — please check back in a few minutes.'
+  );
+}
+
+
 let polling = false;
 
 async function pollOnce(context: WatcherContext): Promise<void> {
@@ -85,17 +121,17 @@ async function pollOnce(context: WatcherContext): Promise<void> {
     //
     // The backend hands back a run only to the caller that atomically CLAIMS
     // it, so this is safe to call on every poll and from every open tab.
-    if (!migrationInFlight) {
+    // The backend's stale-run claim is the real mutual exclusion (see above).
+// This flag prevents us from calling recoverStaleMigration while a migration
+// we triggered in this same tab is still in its poll loop.
+if (!migrationInFlight) {
       try {
-        const staleRun = await recoverStaleMigration(context.issueId);
-        // Shape guard, not a truthiness guard — for exactly the reason spelled
-        // out on pollPendingSession below: the resolver bridge does not
-        // reliably round-trip `null`, and "nothing to recover" is by far the
-        // common case here. A bare `if (staleRun)` would treat the `{}` that
-        // comes back instead as a real run and blow up on `run.items`.
-        if (staleRun && Array.isArray(staleRun.items) && staleRun.items.length > 0) {
-          console.log(`[ProjectBucket] pollOnce: recovered stale run ${staleRun.id}, auto-resuming...`);
-          await resumeRecoveredRun(context, staleRun);
+        const staleQueued = await recoverStaleMigration(context.issueId);
+        // Shape guard (see pollPendingSession comment below for why `{}` can
+        // come back instead of null and a bare truthiness guard breaks).
+        if (staleQueued && typeof staleQueued.runId === 'string') {
+          console.log(`[ProjectBucket] pollOnce: re-queued stale run ${staleQueued.runId}, auto-resuming...`);
+          await resumeRecoveredRun(context, staleQueued.runId);
           return; // Recovery handled this cycle; skip the new-session check.
         }
       } catch (recoveryError) {
@@ -155,30 +191,29 @@ async function presentDetectionPopup(context: WatcherContext, session: Session):
 }
 
 async function runMigrationForSession(context: WatcherContext, session: Session): Promise<void> {
-  console.log('[ProjectBucket] runMigrationForSession: starting on backend, session.id =', session.id, 'items =', session.items.length);
+  console.log('[ProjectBucket] runMigrationForSession: queuing backend migration, session.id =', session.id, 'items =', session.items.length);
   migrationInFlight = true;
   try {
-    const finished = await migrateSessionOnBackend({
+    // The backend creates the DB run, enqueues the async worker, and returns
+    // { runId, status: 'RUNNING' } immediately. All streaming happens in the
+    // 900-second async worker — no file data passes through the browser.
+    const queued = await migrateSessionOnBackend({
       sessionId: session.id,
       issueId: context.issueId,
       projectId: context.projectId,
+      items: session.items.map((item) => ({
+        jiraAttachmentId: item.jiraAttachmentId,
+        filename: item.filename,
+      })),
     });
-    console.log('[ProjectBucket] runMigrationForSession: migrateSessionOnBackend finished, status =', finished.status);
+
+    console.log('[ProjectBucket] runMigrationForSession: queued async run', queued.runId, '— polling for completion');
+    const finished = await pollUntilDone(queued.runId);
+    console.log('[ProjectBucket] runMigrationForSession: run finished with status =', finished.status);
     await presentSummaryFlag(context, finished);
     await maybeRefreshIssueView(finished);
   } catch (error) {
-    console.error('[ProjectBucket] runMigrationForSession backend attempt failed, checking fallback:', error);
-    try {
-      const run = await forceRecoverSessionMigration(session.id);
-      if (run && Array.isArray(run.items) && run.items.length > 0) {
-        console.log('[ProjectBucket] runMigrationForSession: backend failed (e.g. timeout), falling back to browser-driven migration', run.id);
-        await resumeRecoveredRun(context, run);
-        return;
-      }
-    } catch (fallbackError) {
-      console.error('[ProjectBucket] runMigrationForSession fallback recovery failed:', fallbackError);
-    }
-
+    console.error('[ProjectBucket] runMigrationForSession failed:', error);
     showFlag({
       id: `pb-migration-error-${session.id}`,
       title: 'Linking to Project Bucket failed',
@@ -191,39 +226,24 @@ async function runMigrationForSession(context: WatcherContext, session: Session)
   }
 }
 
+
 // Resumes a migration run that was interrupted when the previous browser tab
-// died. Shows a non-dismissible "Resuming…" flag during the migration so
-// the customer knows something is happening, then presents the normal
-// outcome summary when it completes.
-//
-// skipMissingSources is deliberately NOT set. The first attempt's contract is
-// that a vanished source fails the whole session, so the user is told nothing
-// moved before anything gets silently skipped — and a resumed run may well BE
-// that first attempt, one whose outcome the user never saw. Retry is where the
-// user opts into leniency, having read the failure; resuming must not make that
-// choice on their behalf. See migrationClient.RunMigrationOptions.
-async function resumeRecoveredRun(context: WatcherContext, run: MigrationRun): Promise<void> {
+// died. The backend has already re-queued the run on the async worker via
+// recoverStaleMigration, so this just shows a "Resuming…" flag and polls
+// for the worker's result — no browser-side upload loop is needed.
+async function resumeRecoveredRun(context: WatcherContext, runId: string): Promise<void> {
   migrationInFlight = true;
-  const count = run.items.filter((item) => item.status === 'PENDING').length;
-  // A recovered run with nothing PENDING is one whose upload phase finished but
-  // whose COMMIT was interrupted — there is nothing left to re-upload, only the
-  // session to finish. Saying "resuming 0 attachments" would be nonsense.
-  const description =
-    count === 0
-      ? 'A previous Link All was interrupted just before it finished. Completing it now…'
-      : `A previous Link All was interrupted. Resuming ${count} remaining ${
-          count === 1 ? 'attachment' : 'attachments'
-        }…`;
+
   const resumeFlag = await showFlag({
-    id: `pb-resuming-${run.id}`,
+    id: `pb-resuming-${runId}`,
     title: 'Resuming migration…',
     type: 'info',
-    description,
+    description: 'A previous Link All was interrupted. The backend has resumed it — please wait…',
     isAutoDismiss: false,
   });
 
   try {
-    const finished = await runMigration(run);
+    const finished = await pollUntilDone(runId);
     resumeFlag.close();
     await presentSummaryFlag(context, finished);
     await maybeRefreshIssueView(finished);
@@ -231,7 +251,7 @@ async function resumeRecoveredRun(context: WatcherContext, run: MigrationRun): P
     resumeFlag.close();
     console.error('[ProjectBucket] resumeRecoveredRun: CAUGHT ERROR:', error);
     showFlag({
-      id: `pb-resume-error-${run.id}`,
+      id: `pb-resume-error-${runId}`,
       title: 'Resuming migration failed',
       type: 'error',
       description: error instanceof Error ? error.message : String(error),
@@ -241,6 +261,7 @@ async function resumeRecoveredRun(context: WatcherContext, run: MigrationRun): P
     migrationInFlight = false;
   }
 }
+
 
 // Renders the outcome of a whole upload session as a single flag, matching the
 // three transactional outcomes:
@@ -286,22 +307,22 @@ async function presentSummaryFlag(context: WatcherContext, run: MigrationRun): P
   const retryAction = {
     text: 'Retry',
     onClick: async () => {
-      // Same reason as runMigrationForSession: the poll loop keeps ticking
-      // while this runs, and a run we are driving must not be offered up for
-      // recovery.
+      // Guard the poll loop against treating this in-flight retry as a stale run.
       migrationInFlight = true;
       try {
         // Close the current summary flag before showing the retry result,
         // otherwise the old flag and the new one would stack.
         activeSummaryFlag?.close();
         activeSummaryFlag = null;
-        const reopened = await retryMigration(run.id);
-        // On retry the user has already seen the strict first-pass failure, so
-        // sources that are definitively gone (404) are withdrawn rather than
-        // failing the session again forever: the surviving files migrate and
-        // the missing ones are reported in an OK-only dialog below.
-        const retried = await runMigration(reopened, { skipMissingSources: true });
+
+        // retryMigrationAsync resets items + re-opens the run + enqueues the
+        // async worker. We just poll for the result — same pattern as Link All.
+        const queued = await retryMigrationAsync(run.id);
+        const retried = await pollUntilDone(queued.runId);
         await presentSummaryFlag(context, retried);
+
+        // If SOURCE_MISSING items appeared, surface the dialog so the user
+        // knows which files are permanently gone from Jira.
         const missing = retried.items
           .filter((item) => item.status === 'SOURCE_MISSING')
           .map((item) => item.filename);
@@ -322,6 +343,7 @@ async function presentSummaryFlag(context: WatcherContext, run: MigrationRun): P
       }
     },
   };
+
 
   if (run.status === 'FAILED') {
     const n = run.requestedCount;

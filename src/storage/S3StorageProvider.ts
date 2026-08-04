@@ -5,7 +5,9 @@ import {
   DeleteObjectCommand,
   HeadObjectCommand,
 } from '@aws-sdk/client-s3';
+import { Upload } from '@aws-sdk/lib-storage';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+
 import {
   AttachmentStorageProvider,
   ByteStream,
@@ -111,20 +113,26 @@ export class S3StorageProvider implements AttachmentStorageProvider {
   async uploadStream(
     ref: string,
     body: any,
-    length: number,
+    _length: number,
     mimeType: string,
     checksum: string
   ): Promise<void> {
-    const command = new PutObjectCommand({
-      Bucket: this.bucket,
-      Key: ref,
-      Body: body,
-      ContentLength: length,
-      ContentType: mimeType,
-      ...(checksum ? { ChecksumSHA256: checksum } : {}),
+    const upload = new Upload({
+      client: this.s3,
+      params: {
+        Bucket: this.bucket,
+        Key: ref,
+        Body: body,
+        ContentType: mimeType,
+        ...(checksum ? { ChecksumSHA256: checksum } : {}),
+      },
+      queueSize: 1, // upload 1 part at a time to minimize RAM usage
+      partSize: 5 * 1024 * 1024, // 5 MB chunks
     });
-    await this.s3.send(command);
+
+    await upload.done();
   }
+
 
   async download(ref: string, options?: DownloadOptions): Promise<ViewUrl> {
     try {

@@ -3,14 +3,17 @@ import { randomUUID } from 'crypto';
 import Resolver from '@forge/resolver';
 import { FileNormalizer } from '../shared/security/normalizer';
 import { validateStateless } from '../shared/security/validators/statelessPipeline';
-import { getStorageProvider, ChecksumType } from '../storage';
+import { getStorageProvider } from '../storage';
 import { ObjectNotFoundError } from '../storage/ObjectNotFoundError';
 import { generateStorageKey, StorageKeyContext } from '../util/storageKey';
 import { mapSettledWithConcurrency } from '../util/concurrency';
 import { extensionOf, AttachmentThumbnailStatus } from '../types/attachment';
 import * as attachmentRepository from '../repositories/attachmentRepository';
 import * as sessionService from '../services/sessionService';
+import * as sessionRepository from '../repositories/sessionRepository';
 import * as migrationService from '../services/migrationService';
+
+import * as migrationRepository from '../repositories/migrationRepository';
 import { getIssueHierarchy } from '../services/jiraIssueHierarchy';
 import * as graphSyncService from '../services/graphSyncService';
 import * as storageConsistencyService from '../services/storageConsistencyService';
@@ -629,83 +632,12 @@ resolver.define('beginMigration', async (req) => {
   return run;
 });
 
-resolver.define('getMigrationUploadTarget', async (req) => {
-  const { migrationId, itemId, length, mimeType, checksum, checksumType } = req.payload as {
-    migrationId: string;
-    itemId: string;
-    length: number;
-    mimeType?: string;
-    checksum: string;
-    checksumType: ChecksumType;
-  };
-  // Minting the target is where the migration path enforces file validation —
-  // see migrationService.getUploadTarget.
-  requireAccountId(req.context);
-  const cloudId = req.context.installContext.replace('ari:cloud:jira::site/', '');
-  return migrationService.getUploadTarget({ migrationId, itemId, length, mimeType, checksum, checksumType, cloudId });
-});
-
-// PHASE 1: record that one item's bytes are verified in storage backend. Does not
-// persist an attachment or touch the native Jira copy — see migrationService.
-resolver.define('stageMigrationItem', async (req) => {
-  const { migrationId, itemId, objectKey, mimeType, size, checksum, thumbnailKey, thumbnailStatus } =
-    req.payload as {
-      migrationId: string;
-      itemId: string;
-      objectKey: string;
-      mimeType: string;
-      size: number;
-      checksum: string;
-      thumbnailKey?: string | null;
-      thumbnailStatus?: AttachmentThumbnailStatus | null;
-    };
-  // Require an authenticated user here too: only the eventual committer's
-  // identity matters for the persisted attachment, but staging is a
-  // user-initiated action and should never run unauthenticated.
-  requireAccountId(req.context);
-  return migrationService.stageMigrationItem({
-    migrationId,
-    itemId,
-    objectKey,
-    mimeType,
-    size,
-    checksum,
-    thumbnailKey,
-    thumbnailStatus,
-  });
-});
-
-// The client's content validation rejected an item's bytes. Withdraws the item
-// from the session (native Jira copy deliberately kept) instead of failing the
-// whole run — see MigrationItemStatus.BLOCKED.
-resolver.define('blockMigrationItem', async (req) => {
-  const { migrationId, itemId, reason } = req.payload as {
-    migrationId: string;
-    itemId: string;
-    reason: string;
-  };
-  requireAccountId(req.context);
-  return migrationService.blockMigrationItem({ migrationId, itemId, reason });
-});
-
-resolver.define('failMigrationItem', async (req) => {
-  const { migrationId, itemId, error } = req.payload as { migrationId: string; itemId: string; error: string };
-  requireAccountId(req.context);
-  await migrationService.failMigrationItem({ migrationId, itemId, error });
-  return { success: true };
-});
-
-// The client saw a definitive 404 downloading an item's content — the native
-// attachment was deleted before it could be linked. The service re-verifies
-// against Jira before withdrawing the item from the session's transaction.
-resolver.define('skipMissingMigrationItem', async (req) => {
-  const { migrationId, itemId } = req.payload as { migrationId: string; itemId: string };
-  requireAccountId(req.context);
-  return migrationService.skipMissingMigrationItem({ migrationId, itemId });
-});
-
 // PHASE 2: the transaction boundary — commit the whole session at once (persist
 // every attachment, then delete every native copy), or abort touching nothing.
+// NOTE: commitMigrationRun is STILL used by the panel's direct-upload flow
+// (uploading a file from disk to Project Bucket). The migration-specific item
+// resolvers (getMigrationUploadTarget, stageMigrationItem, etc.) have been
+// removed because the async worker handles all of that on the backend now.
 resolver.define('commitMigrationRun', async (req) => {
   const { migrationId } = req.payload as { migrationId: string };
   const actorAccountId = requireAccountId(req.context);
@@ -715,10 +647,25 @@ resolver.define('commitMigrationRun', async (req) => {
   return result;
 });
 
-resolver.define('retryMigration', async (req) => {
+// Retry a FAILED or PARTIAL_FAILURE run via the async worker. Resets items to
+// PENDING (for a FAILED run) or leaves them as-is (for PARTIAL_FAILURE where
+// only the native-copy deletions need to be retried), re-opens the run to
+// RUNNING, then enqueues an async event so the 900-second worker finishes it.
+// The watcher polls getMigrationRunStatus for the result.
+resolver.define('retryMigrationAsync', async (req) => {
   const { migrationId } = req.payload as { migrationId: string };
   requireAccountId(req.context);
-  return migrationService.prepareRetry(migrationId);
+  const cloudId = req.context.cloudId;
+  if (!cloudId) throw new Error('Could not resolve cloudId from context');
+
+  // prepareRetry resets items and re-opens the run in SQL. The Queue push then
+  // hands it to the worker that does the actual streaming/commit under 900s.
+  const run = await migrationService.prepareRetry(migrationId);
+  const { Queue } = await import('@forge/events');
+  const migrationQueue = new Queue({ key: 'migrate-session-queue' });
+  await migrationQueue.push({ body: { migrationId: run.id, cloudId } });
+  console.log(`[ProjectBucket] retryMigrationAsync: queued async retry for run ${run.id}`);
+  return { runId: run.id, status: 'RUNNING' as const };
 });
 
 resolver.define('getMigrationDiagnostics', async (req) => {
@@ -732,13 +679,28 @@ resolver.define('getMigrationDiagnostics', async (req) => {
 // there is nothing to recover. The claim is a compare-and-swap, so calling this
 // on every poll cycle and from every open tab is safe — only one caller can
 // ever win a given run.
+// When a stale run is claimed it is immediately re-queued on the async worker
+// (900-second timeout) so recovery is fully backend-driven — no browser-side
+// upload loop required.
 resolver.define('recoverStaleMigration', async (req) => {
   const { issueId } = req.payload as { issueId: string };
   if (!issueId) throw new Error('recoverStaleMigration requires an issueId');
-  // Claiming a run mutates it (items are reset to PENDING), so it is gated on
-  // an authenticated user like every other mutating step of the pipeline.
   requireAccountId(req.context);
-  return migrationService.recoverStaleRun(issueId);
+  const cloudId = req.context.cloudId;
+  if (!cloudId) throw new Error('Could not resolve cloudId from context');
+
+  const staleRun = await migrationService.recoverStaleRun(issueId);
+  if (!staleRun) return null;
+
+  // Re-queue the claimed run so the async worker picks it up — the watcher
+  // only needs to poll getMigrationRunStatus for completion.
+  const { Queue } = await import('@forge/events');
+  const migrationQueue = new Queue({ key: 'migrate-session-queue' });
+  await migrationQueue.push({ body: { migrationId: staleRun.id, cloudId } });
+  console.log(`[ProjectBucket] recoverStaleMigration: re-queued stale run ${staleRun.id} for issue ${issueId}`);
+
+  // Return just enough for the watcher to know a runId was found and to start polling.
+  return { runId: staleRun.id, status: 'RUNNING' as const };
 });
 
 resolver.define('resolveIssueContext', async (req) => {
@@ -758,22 +720,36 @@ resolver.define('resolveIssueContext', async (req) => {
 });
 
 resolver.define('migrateSessionOnBackend', async (req) => {
-  const { sessionId, issueId, projectId } = req.payload as {
+  const { sessionId, issueId, projectId, items } = req.payload as {
     sessionId: string;
     issueId: string;
     projectId: string;
+    items: { jiraAttachmentId: string; filename: string }[];
   };
   const actorAccountId = requireAccountId(req.context);
   const cloudId = req.context.cloudId;
   if (!cloudId) throw new Error('Could not resolve cloudId from context');
 
+  // Returns { runId, status: 'RUNNING' } immediately — the actual streaming is
+  // done by the async worker (onMigrateSessionEvent) under a 900-second timeout.
   return migrationService.migrateSessionOnBackend({
     sessionId,
     issueId,
     projectId,
     actorAccountId,
     cloudId,
+    items,
   });
+});
+
+// Polled by the frontend after triggering migrateSessionOnBackend. Returns the
+// current MigrationRun from SQL so the watcher can detect when the async worker
+// has finished (status COMPLETED, FAILED, or PARTIAL_FAILURE).
+resolver.define('getMigrationRunStatus', async (req) => {
+  const { migrationId } = req.payload as { migrationId: string };
+  if (!migrationId) throw new Error('getMigrationRunStatus requires a migrationId');
+  requireAccountId(req.context); // Ensures only authenticated users can poll.
+  return migrationRepository.getMigrationRun(migrationId);
 });
 
 resolver.define('forceRecoverSessionMigration', async (req) => {
@@ -783,4 +759,21 @@ resolver.define('forceRecoverSessionMigration', async (req) => {
   return migrationService.forceRecoverSessionMigration(sessionId);
 });
 
+// Admin/maintenance resolver to purge old resolved sessions and completed/failed migration logs.
+
+resolver.define('purgeStaleLogs', async (req) => {
+  requireAccountId(req.context);
+  const { sessionRetentionDays, runRetentionDays } = (req.payload as {
+    sessionRetentionDays?: number;
+    runRetentionDays?: number;
+  }) ?? {};
+
+  const sessions = await sessionRepository.purgeOldSessions(sessionRetentionDays ?? 7);
+  const runs = await migrationRepository.purgeOldMigrationRuns(runRetentionDays ?? 30);
+  return { prunedSessions: sessions, prunedRuns: runs };
+});
+
+
 export const handler = resolver.getDefinitions();
+
+

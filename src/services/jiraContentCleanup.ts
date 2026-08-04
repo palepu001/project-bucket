@@ -1,4 +1,5 @@
-import api, { route } from '@forge/api';
+import { route } from '@forge/api';
+import { requestJiraSmart } from '../util/jiraApi';
 
 // Removes the "dead object" cards a migration would otherwise leave behind.
 //
@@ -53,7 +54,7 @@ export async function resolveMediaId(attachmentId: string): Promise<string | nul
     // Location header without downloading the file. If the runtime follows
     // the redirect anyway, the final response URL embeds the same UUID — and
     // the Range header keeps that fallback download to a single byte.
-    const response = await api.asUser().requestJira(route`/rest/api/3/attachment/content/${attachmentId}`, {
+    const response = await requestJiraSmart(route`/rest/api/3/attachment/content/${attachmentId}`, {
       headers: { Range: 'bytes=0-0' },
       redirect: 'manual',
     });
@@ -130,7 +131,7 @@ function isEffectivelyEmpty(doc: AdfNode): boolean {
 export async function removeMediaReferences(issueId: string, deletedMediaIds: string[]): Promise<void> {
   const deleted = new Set(deletedMediaIds.map((id) => id.toLowerCase()));
 
-  const issueResponse = await api.asUser().requestJira(route`/rest/api/3/issue/${issueId}?fields=description,attachment`);
+  const issueResponse = await requestJiraSmart(route`/rest/api/3/issue/${issueId}?fields=description,attachment`);
   if (!issueResponse.ok) {
     throw new Error(`Failed to load issue ${issueId} for media cleanup: HTTP ${issueResponse.status}`);
   }
@@ -166,7 +167,7 @@ async function cleanDescription(
   try {
     // notifyUsers=false: this is invisible housekeeping, not an edit anyone
     // needs an email about.
-    const response = await api.asUser().requestJira(route`/rest/api/3/issue/${issueId}?notifyUsers=false`, {
+    const response = await requestJiraSmart(route`/rest/api/3/issue/${issueId}?notifyUsers=false`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ fields: { description: doc } }),
@@ -188,9 +189,9 @@ async function cleanComments(issueId: string, shouldRemove: (mediaId: string) =>
   for (let startAt = 0; startAt < maxComments; startAt += pageSize) {
     let page: { comments: { id: string; body: AdfNode | null }[]; total: number };
     try {
-      const response = await api
-        .asUser()
-        .requestJira(route`/rest/api/3/issue/${issueId}/comment?startAt=${startAt}&maxResults=${pageSize}`);
+      const response = await requestJiraSmart(
+        route`/rest/api/3/issue/${issueId}/comment?startAt=${startAt}&maxResults=${pageSize}`
+      );
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}`);
       }
@@ -209,20 +210,22 @@ async function cleanComments(issueId: string, shouldRemove: (mediaId: string) =>
         if (isEffectivelyEmpty(doc)) {
           // The comment existed only to carry the file; with the file now in
           // Project Bucket an empty husk of a comment is just more clutter.
-          const response = await api
-            .asUser()
-            .requestJira(route`/rest/api/3/issue/${issueId}/comment/${comment.id}`, { method: 'DELETE' });
+          const response = await requestJiraSmart(
+            route`/rest/api/3/issue/${issueId}/comment/${comment.id}`,
+            { method: 'DELETE' }
+          );
           if (!response.ok && response.status !== 404) {
             throw new Error(`HTTP ${response.status}`);
           }
         } else {
-          const response = await api
-            .asUser()
-            .requestJira(route`/rest/api/3/issue/${issueId}/comment/${comment.id}`, {
+          const response = await requestJiraSmart(
+            route`/rest/api/3/issue/${issueId}/comment/${comment.id}`,
+            {
               method: 'PUT',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ body: doc }),
-            });
+            }
+          );
           if (!response.ok) {
             throw new Error(`HTTP ${response.status}`);
           }
