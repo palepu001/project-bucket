@@ -1109,67 +1109,69 @@ export async function migrateSessionOnBackend(params: {
 
   const runItems = await migrationRepository.getStagedMigrationItems(run.id);
 
-  for (const item of runItems) {
-    if (item.status !== 'PENDING' && item.status !== 'UPLOADING') {
-      continue;
-    }
-
-    try {
-      await migrationRepository.updateMigrationItem(item.id, {
-        status: 'UPLOADING',
-        startedAt: true,
-      });
-
-      const meta = await getAttachmentMetadata(item.jiraAttachmentId);
-      if (!meta) {
-        throw new Error('Attachment is missing in Jira');
+  await Promise.all(
+    runItems.map(async (item) => {
+      if (item.status !== 'PENDING' && item.status !== 'UPLOADING') {
+        return;
       }
 
-      const downloadStream = await downloadNativeAttachmentStream(item.jiraAttachmentId);
-      const hasher = new HashingStream();
-      const piped = getReadableStream(downloadStream).pipe(hasher);
+      try {
+        await migrationRepository.updateMigrationItem(item.id, {
+          status: 'UPLOADING',
+          startedAt: true,
+        });
 
-      const hierarchy = await getIssueHierarchy(run.issueId);
-      const storageContext: StorageKeyContext = {
-        cloudId,
-        projectKey: hierarchy.projectKey,
-        issueKey: hierarchy.issueKey,
-        epicKey: hierarchy.epicKey,
-      };
-      const objectKey = generateStorageKey(storageContext);
+        const meta = await getAttachmentMetadata(item.jiraAttachmentId);
+        if (!meta) {
+          throw new Error('Attachment is missing in Jira');
+        }
 
-      const provider = await getStorageProvider({ projectId: run.projectId });
-      await provider.uploadStream(
-        objectKey,
-        piped,
-        meta.size,
-        meta.mimeType,
-        ''
-      );
+        const downloadStream = await downloadNativeAttachmentStream(item.jiraAttachmentId);
+        const hasher = new HashingStream();
+        const piped = getReadableStream(downloadStream).pipe(hasher);
 
-      const finalChecksum = hasher.getHashBase64();
-      const bytesWritten = hasher.getBytesWritten();
-      if (bytesWritten !== meta.size) {
-        throw new Error(`Size mismatch: expected ${meta.size} bytes, got ${bytesWritten}`);
+        const hierarchy = await getIssueHierarchy(run.issueId);
+        const storageContext: StorageKeyContext = {
+          cloudId,
+          projectKey: hierarchy.projectKey,
+          issueKey: hierarchy.issueKey,
+          epicKey: hierarchy.epicKey,
+        };
+        const objectKey = generateStorageKey(storageContext);
+
+        const provider = await getStorageProvider({ projectId: run.projectId });
+        await provider.uploadStream(
+          objectKey,
+          piped,
+          meta.size,
+          meta.mimeType,
+          ''
+        );
+
+        const finalChecksum = hasher.getHashBase64();
+        const bytesWritten = hasher.getBytesWritten();
+        if (bytesWritten !== meta.size) {
+          throw new Error(`Size mismatch: expected ${meta.size} bytes, got ${bytesWritten}`);
+        }
+
+        await stageMigrationItem({
+          migrationId: run.id,
+          itemId: item.id,
+          objectKey,
+          mimeType: meta.mimeType,
+          size: bytesWritten,
+          checksum: finalChecksum,
+        });
+      } catch (error: any) {
+        console.error(`[ProjectBucket] migrateSessionOnBackend: item ${item.filename} failed:`, error);
+        await failMigrationItem({
+          migrationId: run.id,
+          itemId: item.id,
+          error: error.message || String(error),
+        });
       }
-
-      await stageMigrationItem({
-        migrationId: run.id,
-        itemId: item.id,
-        objectKey,
-        mimeType: meta.mimeType,
-        size: bytesWritten,
-        checksum: finalChecksum,
-      });
-    } catch (error: any) {
-      console.error(`[ProjectBucket] migrateSessionOnBackend: item ${item.filename} failed:`, error);
-      await failMigrationItem({
-        migrationId: run.id,
-        itemId: item.id,
-        error: error.message || String(error),
-      });
-    }
-  }
+    })
+  );
 
   const freshItems = await migrationRepository.getStagedMigrationItems(run.id);
   const resumable = selectResumableItems(freshItems);
