@@ -552,20 +552,30 @@ resolver.define('pollPendingSession', async (req) => {
       const nativeAttachments = issue.fields.attachment || [];
       console.log(`[ProjectBucket] pollPendingSession: sweep found ${nativeAttachments.length} native attachment(s) on issue ${issueId}`);
 
-      if (nativeAttachments.length === 0) {
-        // The sweep authoritatively found nothing to migrate. Suppress the
-        // popup — the session is stale or all attachments were already linked.
-        console.log(`[ProjectBucket] pollPendingSession: suppressing session ${session.id} — no native attachments remain on issue`);
+      // Filter out attachments that have ALREADY been migrated into Project
+      // Bucket. Without this, a popup would re-offer files that are already
+      // safely stored — clicking "Link All" on such a popup would create
+      // duplicate rows in S3 and the attachments table.
+      const migratedIds = await attachmentRepository.getMigratedJiraAttachmentIds(issueId);
+      const unmigratedAttachments = nativeAttachments.filter(
+        (a: any) => !migratedIds.has(String(a.id))
+      );
+
+      if (unmigratedAttachments.length === 0) {
+        // Every native attachment on this issue is already in Project Bucket.
+        // Suppress the popup and close out the session cleanly.
+        console.log(`[ProjectBucket] pollPendingSession: suppressing session ${session.id} — all native attachments already migrated`);
+        await sessionRepository.markSessionResolved(session.id);
         return null;
       }
 
-      // Replace the DB-captured items with the live sweep result so the popup
-      // names exactly the files Jira currently holds and so beginMigration
-      // references real, downloadable attachment IDs.
-      session.items = nativeAttachments.map((a: any) => ({
+      // Replace the DB-captured items with the live unmigrated sweep result so
+      // the popup names exactly the files that still need migrating and so
+      // beginMigration references real, downloadable attachment IDs.
+      session.items = unmigratedAttachments.map((a: any) => ({
         id: randomUUID(),
         sessionId: session.id,
-        jiraAttachmentId: a.id,
+        jiraAttachmentId: String(a.id),
         filename: a.filename,
         size: a.size,
         mimeType: a.mimeType,
