@@ -3,7 +3,6 @@ import ForgeReconciler, {
   Heading,
   Text,
   Textfield,
-  Toggle,
   Button,
   FormSection,
   FormFooter,
@@ -12,18 +11,31 @@ import ForgeReconciler, {
   Strong,
   Badge,
   Label,
+  Modal,
+  ModalTransition,
+  ModalBody,
+  ModalHeader,
+  ModalTitle,
+  Inline,
+  Box,
 } from '@forge/react';
 import { invoke } from '@forge/bridge';
 
 const AdminPage = () => {
   const [loading, setLoading] = useState(true);
-  const [mode, setMode] = useState<'INSTANCE' | 'PROJECT'>('INSTANCE');
+  const [credentials, setCredentials] = useState<any>(null);
   const [bucketStatus, setBucketStatus] = useState<any>(null);
   const [message, setMessage] = useState<{ text: string; type: 'information' | 'success' | 'warning' | 'error' } | null>(null);
 
+  // Modal State
+  const [isModalOpen, setIsModalOpen] = useState(false);
   const [accessKeyId, setAccessKeyId] = useState('');
   const [secretAccessKey, setSecretAccessKey] = useState('');
   const [region, setRegion] = useState('');
+
+  // Action pending states
+  const [testingConnection, setTestingConnection] = useState(false);
+  const [provisioning, setProvisioning] = useState(false);
 
   useEffect(() => {
     loadSettings();
@@ -32,7 +44,7 @@ const AdminPage = () => {
   const loadSettings = async () => {
     try {
       const data: any = await invoke('getSettings');
-      setMode(data.mode);
+      setCredentials(data.credentials);
       setBucketStatus(data.bucketStatus);
     } catch (e: any) {
       setMessage({ text: `Failed to load settings: ${e.message}`, type: 'error' });
@@ -41,43 +53,46 @@ const AdminPage = () => {
     }
   };
 
-  const onModeChange = async (newMode: boolean) => {
-    const val = newMode ? 'PROJECT' : 'INSTANCE';
-    await invoke('setMode', { mode: val });
-    setMode(val);
-    setMessage({ text: 'Storage mode updated.', type: 'success' });
-  };
-
   const onSubmitCredentials = async () => {
     try {
       await invoke('saveCredentials', { accessKeyId, secretAccessKey, region });
-      setMessage({ text: 'Credentials saved.', type: 'success' });
+      setMessage({ text: 'AWS Credentials saved successfully.', type: 'success' });
+      setIsModalOpen(false);
+      setAccessKeyId('');
+      setSecretAccessKey('');
+      setRegion('');
       await loadSettings();
     } catch (e: any) {
       setMessage({ text: `Failed to save credentials: ${e.message}`, type: 'error' });
     }
   };
 
-  const onProvision = async () => {
-    try {
-      const res: any = await invoke('provision');
-      setMessage({ text: `Bucket provisioned: ${res.bucketName}`, type: 'success' });
-      await loadSettings();
-    } catch (e: any) {
-      setMessage({ text: e.message, type: 'error' });
-    }
-  };
-
   const onTestConnection = async () => {
+    setTestingConnection(true);
     try {
       const res: any = await invoke('testConnection');
       if (res.success) {
-        setMessage({ text: 'Connection test passed.', type: 'success' });
+        setMessage({ text: 'Connection test passed successfully.', type: 'success' });
       } else {
         setMessage({ text: `Connection test failed: ${res.error}`, type: 'error' });
       }
     } catch (e: any) {
       setMessage({ text: `Connection test failed: ${e.message}`, type: 'error' });
+    } finally {
+      setTestingConnection(false);
+    }
+  };
+
+  const onProvisionInstance = async () => {
+    setProvisioning(true);
+    try {
+      const res: any = await invoke('provision');
+      setMessage({ text: `Global S3 bucket provisioned: ${res.bucketName}`, type: 'success' });
+      await loadSettings();
+    } catch (e: any) {
+      setMessage({ text: e.message, type: 'error' });
+    } finally {
+      setProvisioning(false);
     }
   };
 
@@ -85,57 +100,87 @@ const AdminPage = () => {
 
   return (
     <Stack space="space.200">
-      <Heading size="large">Project Bucket Storage Settings</Heading>
-      <Text>Configure the S3 backend for Project Bucket attachment storage.</Text>
+      <Text>Configure and manage S3-compatible backend storage for all Jira attachments.</Text>
       
       {message && <SectionMessage appearance={message.type}>{message.text}</SectionMessage>}
 
+      {/* S3 Credentials Configuration Panel */}
       <Stack space="space.100">
-        <Heading size="medium">Storage Allocation</Heading>
-        <Toggle
-          id="mode-toggle"
-          label="Allocate storage per project (Project Mode)"
-          isChecked={mode === 'PROJECT'}
-          onChange={(e) => onModeChange(e.target.checked ?? false)}
-        />
-        <Text>
-          {mode === 'INSTANCE'
-            ? 'Instance Mode: All projects share a single S3 bucket configured below.'
-            : 'Project Mode: Each project admin will configure their own S3 bucket.'}
-        </Text>
+        <Heading size="medium">AWS S3 Connection</Heading>
+        <Inline space="space.100" alignBlock="center">
+          {credentials?.configured ? (
+            <Badge appearance="added">CONNECTED</Badge>
+          ) : (
+            <Badge appearance="important">NOT CONNECTED</Badge>
+          )}
+          {credentials?.region && (
+            <Text>Region: <Strong>{credentials.region}</Strong></Text>
+          )}
+          {credentials?.accessKeyIdLast4 && (
+            <Text>Access Key ending in: <Strong>****{credentials.accessKeyIdLast4}</Strong></Text>
+          )}
+        </Inline>
+        <Inline space="space.100">
+          <Button onClick={() => setIsModalOpen(true)}>Configure AWS S3 Connection</Button>
+          {credentials?.configured && (
+            <Button onClick={onTestConnection} isDisabled={testingConnection}>
+              {testingConnection ? 'Testing...' : 'Test Connection'}
+            </Button>
+          )}
+        </Inline>
       </Stack>
 
-      {mode === 'INSTANCE' && (
-        <Stack space="space.200">
-          <FormSection>
-            <Heading size="medium">Instance S3 Credentials</Heading>
-            <Label labelFor="accessKeyId">Access Key ID</Label>
-            <Textfield name="accessKeyId" id="accessKeyId" value={accessKeyId} onChange={(e) => setAccessKeyId(e.target.value)} />
-            <Label labelFor="secretAccessKey">Secret Access Key</Label>
-            <Textfield name="secretAccessKey" id="secretAccessKey" type="password" value={secretAccessKey} onChange={(e) => setSecretAccessKey(e.target.value)} />
-            <Label labelFor="region">AWS Region</Label>
-            <Textfield name="region" id="region" value={region} onChange={(e) => setRegion(e.target.value)} />
-          </FormSection>
-          <FormFooter>
-            <Button appearance="primary" onClick={onSubmitCredentials}>Save Credentials</Button>
-            <Button onClick={onTestConnection}>Test Connection</Button>
-            <Button onClick={onProvision}>Provision Bucket</Button>
-          </FormFooter>
-        </Stack>
-      )}
-
-      {mode === 'INSTANCE' && (
-        <Stack space="space.100">
-          <Heading size="medium">Bucket Status</Heading>
-          {bucketStatus ? (
+      {/* Shared Global Bucket Details */}
+      <Stack space="space.100">
+        <Heading size="medium">Global S3 Bucket Status</Heading>
+        {bucketStatus ? (
+          <Stack space="space.100">
             <Text>
-              Status: <Badge>{bucketStatus.status}</Badge> Name: <Strong>{bucketStatus.name}</Strong>
+              Status: <Badge appearance={bucketStatus.status === 'PROVISIONED' ? 'added' : 'neutral'}>{bucketStatus.status}</Badge> Name: <Strong>{bucketStatus.name}</Strong>
             </Text>
-          ) : (
-            <Text>Not provisioned yet.</Text>
-          )}
-        </Stack>
-      )}
+            {bucketStatus.provisionedAt && (
+              <Text>Provisioned At: {new Date(bucketStatus.provisionedAt).toLocaleString()}</Text>
+            )}
+          </Stack>
+        ) : (
+          <Text>Not provisioned yet.</Text>
+        )}
+        {credentials?.configured && (
+          <FormFooter>
+            <Button appearance="primary" onClick={onProvisionInstance} isDisabled={provisioning}>
+              {provisioning ? 'Provisioning...' : (bucketStatus ? 'Re-provision Bucket' : 'Provision Bucket')}
+            </Button>
+          </FormFooter>
+        )}
+      </Stack>
+
+      {/* Credentials Setup Modal */}
+      <ModalTransition>
+        {isModalOpen && (
+          <Modal onClose={() => setIsModalOpen(false)}>
+            <ModalHeader>
+              <ModalTitle>Configure AWS S3 Connection</ModalTitle>
+            </ModalHeader>
+            <ModalBody>
+              <Box padding="space.300">
+                <FormSection>
+                  <Text>Provide S3-compatible credentials. The credentials will be stored securely and used to manage the global bucket and attachments.</Text>
+                  <Label labelFor="accessKeyId">Access Key ID</Label>
+                  <Textfield name="accessKeyId" id="accessKeyId" value={accessKeyId} onChange={(e) => setAccessKeyId(e.target.value)} />
+                  <Label labelFor="secretAccessKey">Secret Access Key</Label>
+                  <Textfield name="secretAccessKey" id="secretAccessKey" type="password" value={secretAccessKey} onChange={(e) => setSecretAccessKey(e.target.value)} />
+                  <Label labelFor="region">AWS Region</Label>
+                  <Textfield name="region" id="region" value={region} onChange={(e) => setRegion(e.target.value)} />
+                </FormSection>
+              </Box>
+            </ModalBody>
+            <FormFooter>
+              <Button appearance="subtle" onClick={() => setIsModalOpen(false)}>Cancel</Button>
+              <Button appearance="primary" onClick={onSubmitCredentials}>Save Connection Settings</Button>
+            </FormFooter>
+          </Modal>
+        )}
+      </ModalTransition>
 
       <Stack space="space.100">
         <Heading size="medium">Danger Zone</Heading>
