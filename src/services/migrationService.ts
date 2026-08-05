@@ -1101,7 +1101,13 @@ export async function migrateSessionOnBackend(params: {
   const session = await sessionRepository.getSessionById(sessionId);
   if (!session) throw new Error(`Attachment session "${sessionId}" not found`);
 
-  await sessionRepository.markSessionNotified(sessionId);
+  // Mark the session RESOLVED immediately — BEFORE creating the migration run.
+  // This is the atomic lock that prevents a second click on a stale popup (or
+  // a concurrent browser tab) from triggering a duplicate migration run.
+  // Previously this called markSessionNotified, which left the session in a
+  // state where appendToSession could still re-arm it and a second popup could
+  // spawn a second run for the exact same files.
+  await sessionRepository.markSessionResolved(sessionId);
 
   // Create the DB run synchronously — this is fast (a few SQL inserts) and
   // must happen here so the browser's poll loop has a runId to track.

@@ -97,9 +97,11 @@ export async function appendToSession(params: {
   const now = nowSqlDateTime();
   const newSessionId = randomUUID();
 
-  // Atomic insert: creates the session only if no PENDING session exists.
-  // This completely eliminates the lambda concurrency race condition that spawned
-  // duplicate sessions when multiple files uploaded at the exact same millisecond.
+  // Atomic insert: creates the session only if no PENDING session exists for this issue.
+  // While a burst is accumulating (status = 'PENDING'), all arriving events join
+  // this session. Once the burst goes quiet and is claimed (status = 'NOTIFIED'),
+  // any subsequent event (e.g. a large video that finished uploading later) will
+  // create a new PENDING session and trigger its own notification popup.
   const insert = await sql
     .prepare(
       `INSERT INTO attachment_sessions (id, issue_id, project_id, status, created_at, last_event_at)
@@ -115,7 +117,8 @@ export async function appendToSession(params: {
   let activeSessionId: string = newSessionId;
 
   if (affectedRows === 0) {
-    // A pending session already existed, or we lost the insert race.
+    // A PENDING session already existed, or we lost the insert race.
+    // Reuse the existing session ID and update last_event_at.
     const existing = await sql
       .prepare("SELECT id FROM attachment_sessions WHERE issue_id = ? AND status = 'PENDING' LIMIT 1")
       .bindParams(params.issueId)

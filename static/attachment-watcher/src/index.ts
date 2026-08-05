@@ -157,11 +157,30 @@ if (!migrationInFlight) {
   }
 }
 
+// Tracks the currently visible detection popup flag. Before presenting a new
+// popup we close the previous one — this guarantees at most ONE detection popup
+// is visible at any time, even if the backend's session consolidation has a
+// brief race window between claiming Session-A and the late event arriving.
+let currentDetectionFlag: { close: () => void } | null = null;
+
 async function presentDetectionPopup(context: WatcherContext, session: Session): Promise<void> {
   const count = session.items.length;
   const filenames = session.items.map((item) => item.filename).join(', ');
   const title = count === 1 ? '1 new native attachment detected' : `${count} new native attachments detected`;
   const linkActionText = count === 1 ? 'Link to Project Bucket' : 'Link All';
+
+  // Close the previously visible detection popup, if any. This covers the edge
+  // case where the watcher re-claims a re-armed session (a late event pulled
+  // it back to PENDING) — the old popup with fewer files is replaced by the
+  // new one listing ALL files in the burst.
+  if (currentDetectionFlag) {
+    try {
+      currentDetectionFlag.close();
+    } catch {
+      // Ignore — the flag may have already been closed by user interaction.
+    }
+    currentDetectionFlag = null;
+  }
 
   const flag = await showFlag({
     id: `pb-session-${session.id}`,
@@ -174,6 +193,7 @@ async function presentDetectionPopup(context: WatcherContext, session: Session):
         text: linkActionText,
         onClick: async () => {
           flag.close();
+          currentDetectionFlag = null;
           await runMigrationForSession(context, session);
         },
       },
@@ -181,6 +201,7 @@ async function presentDetectionPopup(context: WatcherContext, session: Session):
         text: 'Cancel',
         onClick: async () => {
           flag.close();
+          currentDetectionFlag = null;
           await dismissSession(session.id).catch((error) =>
             console.error('[ProjectBucket] Failed to dismiss session:', error)
           );
@@ -188,6 +209,9 @@ async function presentDetectionPopup(context: WatcherContext, session: Session):
       },
     ],
   });
+
+  // Store the flag handle so the next call to presentDetectionPopup can close it.
+  currentDetectionFlag = flag;
 }
 
 async function runMigrationForSession(context: WatcherContext, session: Session): Promise<void> {

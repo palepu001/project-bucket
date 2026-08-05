@@ -246,3 +246,25 @@ export async function deleteAttachmentRow(id: string): Promise<void> {
   await ensureSchema();
   await sql.prepare('DELETE FROM attachments WHERE id = ?').bindParams(id).execute();
 }
+
+/**
+ * Returns the set of native Jira attachment IDs that have ALREADY been migrated
+ * into Project Bucket for this issue. Used by the sweep in pollPendingSession
+ * and the dedup guard in migrateSessionOnBackend to avoid re-offering or
+ * re-uploading files that are already safely stored.
+ *
+ * Only considers ACTIVE rows (not DELETED or ORPHANED) because a soft-deleted
+ * attachment should not block re-migration if the user somehow re-uploads the
+ * same native file after removing it from Project Bucket.
+ */
+export async function getMigratedJiraAttachmentIds(issueId: string): Promise<Set<string>> {
+  await ensureSchema();
+  const result = await sql
+    .prepare(
+      "SELECT jira_attachment_id FROM attachments WHERE issue_id = ? AND jira_attachment_id IS NOT NULL AND status = 'ACTIVE'"
+    )
+    .bindParams(issueId)
+    .execute();
+  const rows = result.rows as unknown as { jira_attachment_id: string }[];
+  return new Set(rows.map((r) => r.jira_attachment_id));
+}
