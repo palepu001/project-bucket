@@ -221,7 +221,7 @@ app:
     name: nodejs24.x
     memoryMB: 256
     architecture: arm64
-  id: ari:cloud:ecosystem::app/ee46cec9-70a0-4b5b-9869-019ff1fb8c68
+  id: ari:cloud:ecosystem::app/ed95ed2a-5bfc-413b-a263-27e9cd176f22
   compatibility:
     jira:
       required: true
