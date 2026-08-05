@@ -7,12 +7,10 @@ import {
   setInstanceCredentials,
   getRedactedInstanceCredentials,
   getInstanceBucketStatus,
-  getProjectCredentials,
-  setProjectCredentials,
-  getRedactedProjectCredentials,
   getProjectBucketStatus,
   setInstanceBucketStatus,
   setProjectBucketStatus,
+  setCloudId,
 } from '../services/storageConfigService';
 import {
   generateInstanceBucketName,
@@ -47,13 +45,17 @@ resolver.define('getSettings', async (req) => {
   const { projectId } = (req.payload || {}) as { projectId?: string };
   await verifyAdminAccess(projectId);
 
+  // Capture and persist the active cloud ID so getStorageProvider can access it
+  // offline/asynchronously during JIT auto-provisioning.
+  const cloudId = req.context.installContext.replace('ari:cloud:jira::site/', '');
+  await setCloudId(cloudId);
+
   const mode = await getStorageMode();
 
   if (projectId) {
-    // Project context
-    const credentials = await getRedactedProjectCredentials(projectId);
+    // Project context uses global S3 credentials but project-specific bucket status
     const bucketStatus = await getProjectBucketStatus(projectId);
-    return { mode, credentials, bucketStatus };
+    return { mode, credentials: { configured: true }, bucketStatus };
   } else {
     // Instance context
     const credentials = await getRedactedInstanceCredentials();
@@ -78,11 +80,9 @@ resolver.define('saveCredentials', async (req) => {
   const creds = { accessKeyId, secretAccessKey, region };
 
   if (projectId) {
-    await setProjectCredentials(projectId, creds);
-    const bucketStatus = await getProjectBucketStatus(projectId);
-    if (bucketStatus?.status === 'PROVISIONED') {
-      await provisionBucket(bucketStatus.name, creds);
-    }
+    // Project-specific credentials are no longer stored individually.
+    // Project admins use the global credentials to provision their buckets.
+    return { success: true };
   } else {
     await setInstanceCredentials(creds);
     const bucketStatus = await getInstanceBucketStatus();
@@ -102,7 +102,8 @@ resolver.define('testConnection', async (req) => {
   const { projectId } = (req.payload || {}) as { projectId?: string };
   await verifyAdminAccess(projectId);
 
-  const creds = projectId ? await getProjectCredentials(projectId) : await getInstanceCredentials();
+  // Both modes use global credentials ("Connect Once" F4)
+  const creds = await getInstanceCredentials();
   if (!creds) {
     throw new Error('No credentials found to test.');
   }
@@ -121,9 +122,10 @@ resolver.define('provision', async (req) => {
   const { projectId } = (req.payload || {}) as { projectId?: string };
   await verifyAdminAccess(projectId);
 
-  const creds = projectId ? await getProjectCredentials(projectId) : await getInstanceCredentials();
+  // Project provisioning uses global S3 credentials
+  const creds = await getInstanceCredentials();
   if (!creds) {
-    throw new Error('Please save credentials before provisioning.');
+    throw new Error('Please save global credentials in Admin Settings before provisioning.');
   }
 
   const cloudId = req.context.installContext.replace('ari:cloud:jira::site/', '');

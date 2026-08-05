@@ -26,6 +26,7 @@ export interface BucketStatus {
 const MODE_KEY = 'storage:mode';
 const CRED_INSTANCE_KEY = 'storage:creds:instance';
 const BUCKET_INSTANCE_KEY = 'storage:bucket:instance';
+const CLOUD_ID_KEY = 'storage:cloudId';
 
 const getProjectCredKey = (projectId: string) => `storage:creds:project:${projectId}`;
 const getProjectBucketKey = (projectId: string) => `storage:bucket:project:${projectId}`;
@@ -37,6 +38,15 @@ export async function getStorageMode(): Promise<StorageMode> {
 
 export async function setStorageMode(mode: StorageMode): Promise<void> {
   await storage.set(MODE_KEY, mode);
+}
+
+export async function getCloudId(): Promise<string | null> {
+  const val = await storage.get(CLOUD_ID_KEY);
+  return val ? String(val) : null;
+}
+
+export async function setCloudId(cloudId: string): Promise<void> {
+  await storage.set(CLOUD_ID_KEY, cloudId);
 }
 
 // --- Credentials ---
