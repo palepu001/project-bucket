@@ -31,12 +31,6 @@ export function generateInstanceBucketName(cloudId: string): string {
   return `pb-${shortCloudId}-${hash}`.toLowerCase();
 }
 
-export function generateProjectBucketName(cloudId: string, projectKey: string): string {
-  const shortCloudId = cloudId.substring(0, 8);
-  const hash = generateShortHash(`project-${cloudId}-${projectKey}`);
-  return `pb-${shortCloudId}-${projectKey.toLowerCase()}-${hash}`.toLowerCase();
-}
-
 export async function provisionBucket(bucketName: string, creds: StorageCredentials): Promise<void> {
   const s3 = new S3Client({
     region: creds.region,

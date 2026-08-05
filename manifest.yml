@@ -15,14 +15,6 @@ modules:
       render: native
       resource: admin-resource
 
-  jira:projectSettingsPage:
-    - key: project-bucket-project-settings
-      title: Project Bucket Storage
-      resolver:
-        function: settings-resolver
-      render: native
-      resource: proj-settings-res
-
   # F3 — Project Bucket issue panel. Owns the entire attachment experience:
   # gallery, upload, search, filter, preview, delete, and diagnostics. Custom
   # UI (not UI Kit) because previews need real <video>/<audio>/<iframe>
@@ -171,8 +163,6 @@ resources:
     path: static/attachment-watcher/build
   - key: admin-resource
     path: src/ui/AdminPage.tsx
-  - key: proj-settings-res
-    path: src/ui/ProjectSettingsPage.tsx
 
 permissions:
   scopes:

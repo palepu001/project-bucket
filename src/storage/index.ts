@@ -2,11 +2,8 @@ import { AttachmentStorageProvider } from './AttachmentStorageProvider';
 import { S3StorageProvider } from './S3StorageProvider';
 import { StorageNotConfiguredError } from './StorageNotConfiguredError';
 import {
-  getStorageMode,
   getInstanceCredentials,
   getInstanceBucketStatus,
-  getProjectCredentials,
-  getProjectBucketStatus,
 } from '../services/storageConfigService';
 
 // Providers are cached because building one costs two KVS reads (mode +
@@ -53,35 +50,18 @@ export function clearStorageProviderCache(): void {
   providerCache.clear();
 }
 
-export async function getStorageProvider(ctx: { projectId: string }): Promise<AttachmentStorageProvider> {
-  const mode = await getStorageMode();
+export async function getStorageProvider(_ctx?: { projectId: string }): Promise<AttachmentStorageProvider> {
+  const hit = cached('INSTANCE');
+  if (hit) return hit;
 
-  if (mode === 'INSTANCE') {
-    const hit = cached('INSTANCE');
-    if (hit) return hit;
+  const creds = await getInstanceCredentials();
+  const bucketStatus = await getInstanceBucketStatus();
 
-    const creds = await getInstanceCredentials();
-    const bucketStatus = await getInstanceBucketStatus();
-
-    if (!creds || !bucketStatus || bucketStatus.status !== 'PROVISIONED') {
-      throw new StorageNotConfiguredError('Instance storage is not fully configured or provisioned.');
-    }
-
-    return remember('INSTANCE', new S3StorageProvider(creds, bucketStatus.name));
-  } else {
-    const cacheKey = `PROJECT_${ctx.projectId}`;
-    const hit = cached(cacheKey);
-    if (hit) return hit;
-
-    const creds = await getProjectCredentials(ctx.projectId);
-    const bucketStatus = await getProjectBucketStatus(ctx.projectId);
-
-    if (!creds || !bucketStatus || bucketStatus.status !== 'PROVISIONED') {
-      throw new StorageNotConfiguredError(`Project storage is not fully configured or provisioned for project ${ctx.projectId}.`);
-    }
-
-    return remember(cacheKey, new S3StorageProvider(creds, bucketStatus.name));
+  if (!creds || !bucketStatus || bucketStatus.status !== 'PROVISIONED') {
+    throw new StorageNotConfiguredError('Instance storage is not fully configured or provisioned.');
   }
+
+  return remember('INSTANCE', new S3StorageProvider(creds, bucketStatus.name));
 }
 
 export * from './AttachmentStorageProvider';
