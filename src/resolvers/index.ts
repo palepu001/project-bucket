@@ -280,7 +280,7 @@ resolver.define('getStorageAudit', async (req) => {
       storedSize: object?.size ?? null,
       storedChecksum: object?.checksum ?? null,
       metadataMatches: object
-        ? object.size === attachment.size && object.checksum === attachment.checksum
+        ? object.size === attachment.size && (!object.checksum || object.checksum === attachment.checksum)
         : false,
     };
   });
