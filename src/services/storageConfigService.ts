@@ -23,6 +23,7 @@ export interface BucketStatus {
 // Keys
 const CRED_INSTANCE_KEY = 'storage:creds:instance';
 const BUCKET_INSTANCE_KEY = 'storage:bucket:instance';
+const KEEP_JIRA_ATTACHMENTS_KEY = 'storage:settings:keepJiraAttachments';
 
 // --- Credentials ---
 
@@ -54,4 +55,21 @@ export async function setInstanceBucketStatus(status: BucketStatus): Promise<voi
 export async function getInstanceBucketStatus(): Promise<BucketStatus | null> {
   const status = await storage.get(BUCKET_INSTANCE_KEY);
   return status ? (status as BucketStatus) : null;
+}
+
+// --- Migration Behaviour Settings ---
+
+/**
+ * Whether to keep the original Jira native attachment after a successful
+ * migration to S3. Defaults to false (delete), preserving the existing
+ * behaviour for all installs that have not explicitly changed this setting.
+ */
+export async function getKeepJiraAttachments(): Promise<boolean> {
+  const value = await storage.get(KEEP_JIRA_ATTACHMENTS_KEY);
+  // Explicit false or unset both mean "delete" — the safe default.
+  return value === true;
+}
+
+export async function setKeepJiraAttachments(keep: boolean): Promise<void> {
+  await storage.set(KEEP_JIRA_ATTACHMENTS_KEY, keep);
 }

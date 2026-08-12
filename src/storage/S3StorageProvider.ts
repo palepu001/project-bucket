@@ -7,6 +7,8 @@ import {
 } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { NodeHttpHandler } from '@smithy/node-http-handler';
+import { Agent } from 'https';
 
 import {
   AttachmentStorageProvider,
@@ -65,12 +67,23 @@ export class S3StorageProvider implements AttachmentStorageProvider {
   public readonly containerName: string;
 
   constructor(creds: StorageCredentials, bucketName: string) {
+    // NodeHttpHandler with a Keep-Alive HTTPS agent reuses TCP sockets across
+    // S3 requests instead of opening a new connection for every chunk PUT.
+    // For a multipart upload with queueSize=2 and partSize=10MB, this removes
+    // the TCP handshake overhead from the second parallel chunk, which is the
+    // most impactful latency saving for typical 20 MB attachment sizes.
+    //
+    // maxSockets is set to 6: 2 active upload parts + 4 headroom for concurrent
+    // HeadObject/GetObject calls the provider makes alongside streaming.
+    // Keeping it low avoids accumulating idle sockets in the Forge container.
+    const httpsAgent = new Agent({ keepAlive: true, maxSockets: 6 });
     this.s3 = new S3Client({
       region: creds.region,
       credentials: {
         accessKeyId: creds.accessKeyId,
         secretAccessKey: creds.secretAccessKey,
       },
+      requestHandler: new NodeHttpHandler({ httpsAgent }),
       requestStreamBufferSize: 65536,
     });
     this.containerName = bucketName;
@@ -126,8 +139,16 @@ export class S3StorageProvider implements AttachmentStorageProvider {
         ContentType: mimeType,
         ...(checksum ? { ChecksumSHA256: checksum } : {}),
       },
-      queueSize: 1, // upload 1 part at a time to minimize RAM usage
-      partSize: 5 * 1024 * 1024, // 5 MB chunks
+      // 10 MB parts with 3 parallel in-flight chunks is the all-round sweet spot:
+      //   20 MB file  → 2 parts,  1 batch  (both in parallel, optimal)
+      //   50 MB file  → 5 parts,  2 batches (was 3 with queueSize:2)
+      //   100 MB file → 10 parts, 4 batches (was 5 with queueSize:2)
+      //   500 MB file → 50 parts, 17 batches (was 25 with queueSize:2)
+      //
+      // RAM footprint: 3 × 10 MB = 30 MB buffer + ~70 MB Node.js = ~100 MB total,
+      // leaving 156 MB of headroom inside the 256 MB Forge container limit.
+      queueSize: 3,
+      partSize: 10 * 1024 * 1024, // 10 MB chunks
     });
 
     await upload.done();
