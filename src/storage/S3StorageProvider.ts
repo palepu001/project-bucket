@@ -139,14 +139,15 @@ export class S3StorageProvider implements AttachmentStorageProvider {
         ContentType: mimeType,
         ...(checksum ? { ChecksumSHA256: checksum } : {}),
       },
-      // 10 MB parts with 2 parallel in-flight chunks optimizes the typical
-      // ~20 MB attachment: the file splits into exactly 2 equal parts that are
-      // sent simultaneously over the Keep-Alive socket pool, cutting transfer
-      // time roughly in half vs. the previous sequential 5 MB chunking.
+      // 10 MB parts with 3 parallel in-flight chunks is the all-round sweet spot:
+      //   20 MB file  → 2 parts,  1 batch  (both in parallel, optimal)
+      //   50 MB file  → 5 parts,  2 batches (was 3 with queueSize:2)
+      //   100 MB file → 10 parts, 4 batches (was 5 with queueSize:2)
+      //   500 MB file → 50 parts, 17 batches (was 25 with queueSize:2)
       //
-      // RAM footprint: 2 × 10 MB = 20 MB buffer, well within the 256 MB
-      // Forge container limit even with Node.js runtime overhead (~70 MB).
-      queueSize: 2,
+      // RAM footprint: 3 × 10 MB = 30 MB buffer + ~70 MB Node.js = ~100 MB total,
+      // leaving 156 MB of headroom inside the 256 MB Forge container limit.
+      queueSize: 3,
       partSize: 10 * 1024 * 1024, // 10 MB chunks
     });
 
