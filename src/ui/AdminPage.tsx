@@ -18,6 +18,7 @@ import ForgeReconciler, {
   ModalTitle,
   Inline,
   Box,
+  Toggle,
 } from '@forge/react';
 import { invoke } from '@forge/bridge';
 
@@ -25,6 +26,9 @@ const AdminPage = () => {
   const [loading, setLoading] = useState(true);
   const [credentials, setCredentials] = useState<any>(null);
   const [bucketStatus, setBucketStatus] = useState<any>(null);
+  // keepJiraAttachments: when true the native Jira copy is NOT deleted after
+  // a successful S3 migration. Loaded from KVS; defaults to false (delete).
+  const [keepJiraAttachments, setKeepJiraAttachments] = useState(false);
   const [message, setMessage] = useState<{ text: string; type: 'information' | 'success' | 'warning' | 'error' } | null>(null);
 
   // Modal State
@@ -46,6 +50,9 @@ const AdminPage = () => {
       const data: any = await invoke('getSettings');
       setCredentials(data.credentials);
       setBucketStatus(data.bucketStatus);
+      // Backend returns false when unset, so this correctly initialises to
+      // the "delete" default for installs that have never touched the toggle.
+      setKeepJiraAttachments(data.keepJiraAttachments ?? false);
     } catch (e: any) {
       setMessage({ text: `Failed to load settings: ${e.message}`, type: 'error' });
     } finally {
@@ -93,6 +100,26 @@ const AdminPage = () => {
       setMessage({ text: e.message, type: 'error' });
     } finally {
       setProvisioning(false);
+    }
+  };
+
+  // Persists the toggle change immediately so the admin doesn't need to
+  // submit a form — the setting takes effect on the next migration run.
+  const onToggleKeepJira = async (e: any) => {
+    const newValue = e.target.checked;
+    setKeepJiraAttachments(newValue);
+    try {
+      await invoke('saveKeepJiraAttachments', { keepJiraAttachments: newValue });
+      setMessage({
+        text: newValue
+          ? 'Jira attachments will be kept after migration.'
+          : 'Jira attachments will be deleted after migration.',
+        type: 'success',
+      });
+    } catch (ex: any) {
+      // Revert the optimistic local update if the save failed.
+      setKeepJiraAttachments(!newValue);
+      setMessage({ text: `Failed to save setting: ${ex.message}`, type: 'error' });
     }
   };
 
@@ -181,6 +208,27 @@ const AdminPage = () => {
           </Modal>
         )}
       </ModalTransition>
+
+      {/* Migration Behaviour */}
+      <Stack space="space.100">
+        <Heading size="medium">Migration Behaviour</Heading>
+        <Text>Control what happens to the original Jira attachment after it is successfully uploaded to S3.</Text>
+        <Inline space="space.100" alignBlock="center">
+          <Toggle
+            id="keepJiraAttachments"
+            isChecked={keepJiraAttachments}
+            onChange={onToggleKeepJira}
+          />
+          <Label labelFor="keepJiraAttachments">
+            Keep original Jira attachments after migration
+          </Label>
+        </Inline>
+        <Text>
+          {keepJiraAttachments
+            ? 'Jira\'s native copy is preserved. Both the S3 copy and the original Jira attachment will remain visible.'
+            : 'Jira\'s native copy is deleted once S3 confirms the upload. This saves Jira storage space (default).'}
+        </Text>
+      </Stack>
 
       <Stack space="space.100">
         <Heading size="medium">Danger Zone</Heading>

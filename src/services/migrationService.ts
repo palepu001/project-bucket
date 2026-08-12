@@ -16,6 +16,7 @@ import { AttachmentThumbnailStatus, extensionOf } from '../types/attachment';
 import { MigrationItemStatus, MigrationRun } from '../types/migration';
 import { verifyIssueAccess } from './jiraIssueAccessService';
 import { assertStoredObjectMatchesFilename } from './contentSignatureService';
+import { getKeepJiraAttachments } from './storageConfigService';
 
 // Orchestrates the Jira-native → Project Bucket migration of ONE upload
 // session as a single transaction. The unit of work is the whole session, not
@@ -652,6 +653,25 @@ async function deleteNativeCopiesAndCleanReferences(
   issueId: string,
   targets: { item: StagedItem; attachmentId: string }[]
 ): Promise<void> {
+  // Check the admin's migration behaviour preference. When keepJiraAttachments
+  // is true, the native Jira copy is intentionally preserved — mark every
+  // target SUCCEEDED immediately without touching Jira or its media graph.
+  const keepJiraAttachments = await getKeepJiraAttachments();
+  if (keepJiraAttachments) {
+    console.log(
+      `[ProjectBucket] deleteNativeCopiesAndCleanReferences: keepJiraAttachments=true, skipping deletion for ${targets.length} item(s)`
+    );
+    for (const { item, attachmentId } of targets) {
+      await migrationRepository.updateMigrationItem(item.id, {
+        status: 'SUCCEEDED',
+        errorMessage: null,
+        completedAt: true,
+      });
+      await attachmentRepository.updateSyncStatus(attachmentId, 'READY');
+    }
+    return;
+  }
+
   // Resolve each attachment's Media Services UUID BEFORE deleting it — the
   // content redirect this relies on stops answering once the attachment is
   // gone. See jiraContentCleanup.ts for the mechanics.

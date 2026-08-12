@@ -6,6 +6,8 @@ import {
   getRedactedInstanceCredentials,
   getInstanceBucketStatus,
   setInstanceBucketStatus,
+  getKeepJiraAttachments,
+  setKeepJiraAttachments,
 } from '../services/storageConfigService';
 import {
   generateInstanceBucketName,
@@ -33,7 +35,9 @@ resolver.define('getSettings', async () => {
   await verifyAdminAccess();
   const credentials = await getRedactedInstanceCredentials();
   const bucketStatus = await getInstanceBucketStatus();
-  return { credentials, bucketStatus };
+  // Read the migration behaviour setting — false (delete) is the default.
+  const keepJiraAttachments = await getKeepJiraAttachments();
+  return { credentials, bucketStatus, keepJiraAttachments };
 });
 
 resolver.define('saveCredentials', async (req) => {
@@ -86,6 +90,18 @@ resolver.define('provision', async (req) => {
 
 resolver.define('purgeLegacy', async () => {
   await verifyAdminAccess();
+  return { success: true };
+});
+
+// Persists the admin's choice about whether native Jira attachments are kept
+// after a successful migration. Only Jira admins may change this setting.
+resolver.define('saveKeepJiraAttachments', async (req) => {
+  await verifyAdminAccess();
+  const { keepJiraAttachments } = req.payload as { keepJiraAttachments: boolean };
+  if (typeof keepJiraAttachments !== 'boolean') {
+    throw new Error('keepJiraAttachments must be a boolean');
+  }
+  await setKeepJiraAttachments(keepJiraAttachments);
   return { success: true };
 });
 
